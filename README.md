@@ -1,5 +1,10 @@
 # dsh-work-summary
 
+[![npm version](https://img.shields.io/npm/v/dsh-work-summary?color=cb3837&logo=npm&logoColor=white)](https://www.npmjs.com/package/dsh-work-summary)
+[![npm downloads](https://img.shields.io/npm/dm/dsh-work-summary?color=cb3837&logo=npm&logoColor=white)](https://www.npmjs.com/package/dsh-work-summary)
+[![dsh](https://img.shields.io/badge/dsh-%3E%3D0.2.3--alpha.2-4D6BFE)](#兼容性)
+[![topic: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-4D6BFE)](https://github.com/topics/dsh-plugin)
+[![dshfind](https://dshfind.com/api/badge/ruochen361/dsh-work-summary?lang=zh)](https://dshfind.com/zh/plugins/ruochen361/dsh-work-summary?ref=badge)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
 DeepSeek Harness 插件：把「每天定时写一份工作日报」变成一条确定流水线——**采集、校验、落盘、推看板交给工具，模型只写正文**。
@@ -18,6 +23,11 @@ plugin_manager install_bundle dsh-work-summary
 ```
 
 装完重启 DSH。默认数据目录 `~/.dsh/dsh-work-summary` 在首次激活时自动创建，首次启用还会接管（或新建）每日计划任务，保留原有的触发时间与投递会话。
+
+## 兼容性
+
+- DSH：`>=0.2.3-alpha.2`（`package.json` 的 `engines.dsh`），开发与验证基线为桌面版 0.2.3-alpha.2；
+- 平台：Web（客户端注入侧边栏）；脚本需要 PowerShell 7（`pwsh`）。
 
 ## 工具
 
