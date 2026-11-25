@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Daily work report",
+    "description": "Collects the day's work traces, validates and writes the daily report, and pushes the next-day checklist onto the board.",
+    "detail": "docs/DETAIL.md"
+  }
+}

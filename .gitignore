@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 运行期数据：默认都在 reportDir（~/.dsh/dsh-work-summary），
+# 若有人把 reportDir 指到仓库内，下面这些不该进版本库
+_源数据/
+日报-*.md
+看板.md
+_日志/
+settings.json

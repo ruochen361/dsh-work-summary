@@ -1,0 +1,9 @@
+- insert:
+    - id: dsh-work-summary
+      name: 'dsh-work-summary'
+      config:
+        # 数据目录默认 ~/.dsh/dsh-work-summary，设置页可改，所以这里不写死。
+        scheduleEnabled: true
+        scheduleAdopt: true
+        scheduleTime: '23:00'
+        scheduleTimeZone: 'Asia/Shanghai'

@@ -1,0 +1,54 @@
+{
+  "name": "dsh-work-summary",
+  "version": "0.2.0",
+  "description": "Daily work report for DeepSeek Harness: collect the day's traces, write and validate a report, push tomorrow's checklist onto the board.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "scripts",
+    "PROMPT.md",
+    "README.md",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "daily-report",
+    "work-summary",
+    "journal",
+    "productivity"
+  ],
+  "engines": {
+    "dsh": ">=0.2.3-alpha.2"
+  },
+  "scripts": {
+    "test": "node test/route.test.mjs",
+    "check": "node --check index.js && node --check client.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "license": "MIT"
+}
