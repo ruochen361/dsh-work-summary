@@ -15,8 +15,6 @@ DeepSeek Harness 插件：把「每天定时写一份工作日报」变成一条
 # 从 npm 安装（已发布时；也可在设置 → 插件里填包名）
 plugin_manager install_bundle dsh-work-summary
 
-# 开发时直接装本地目录（link 安装，改代码即生效）
-plugin_manager install_bundle <插件目录>
 ```
 
 装完重启 DSH。默认数据目录 `~/.dsh/dsh-work-summary` 在首次激活时自动创建，首次启用还会接管（或新建）每日计划任务，保留原有的触发时间与投递会话。
@@ -76,11 +74,6 @@ node test\route.test.mjs   # 假 ctx 驱动真实 apply：工具、路由、计�
 ```
 
 仓库结构：`index.js`（Host：工具 / 计划任务 / HTTP 路由）、`client.js`（侧边栏与设置页）、`scripts/*.ps1`（采集与看板）、`PROMPT.md`（正文规则，改完下一轮生效）、`docs/DETAIL.md`（详细说明）。
-
-两个踩过的坑，改代码时别踩回去：
-
-- **不裸导入 `@deepseek-ai/*`**：`link` 安装的 bundle 没有 `node_modules`，工具直接按注册表接受的普通对象写。
-- **调 pwsh 用 `-Command` 并先设 UTF-8**：管道重定向下 pwsh 默认按系统 ANSI 写 stdout，中文输出会乱码，`已写入 N 条` 这类解析随之失效。
 
 ## 限制
 
