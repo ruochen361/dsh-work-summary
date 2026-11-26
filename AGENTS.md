@@ -7,7 +7,7 @@
 `dsh-work-summary` 是 DeepSeek Harness（DSH）插件，由三部分组成：
 
 - **Host** `index.js`：ESM，注册工具、HTTP 路由、计划任务；不直接读写浏览器。
-- **浏览器半** `client.js`：通过 `window.__ModuleLoader__.load(...)` 挂侧边栏「日报」页面，含日报、周期、看板、设置四个视图。
+- **浏览器半** `client.js`：通过 `window.__ModuleLoader__.load(...)` 挂侧边栏「日报」页面，含日报、周期、热力图、看板、设置五个视图。
 - **脚本半** `scripts/*.ps1`：PowerShell 7 采集与看板操作，由 Host 通过 `pwsh` 调用。
 
 运行期数据默认在 `~/.dsh/dsh-work-summary`，不属于代码仓库。不要 import `@deepseek-ai/*`：插件按本地 link 安装，没有 `node_modules`。

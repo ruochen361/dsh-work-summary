@@ -463,6 +463,33 @@ function sectionLines(text, number) {
   return out
 }
 
+/**
+ * 逐日热力值：非空行数 + 产出条目数 × 3。
+ * 行数代表当天写了多少，产出条目代表落地的结果；权重 3 让「有产出」的一天明显亮于「写得长但没产出」。
+ * @param {string} content - 日报正文。
+ * @returns {{ lines: number, outputs: number, score: number }} 统计值。
+ */
+function heatStats(content) {
+  const text = String(content)
+  const lines = text.split(/\r?\n/).filter((line) => {
+    const trimmed = line.trim()
+    return trimmed !== '' && !/^---+$/.test(trimmed)
+  }).length
+  let outputs = 0
+  for (const line of sectionLines(text, '三')) {
+    const trimmed = line.trim()
+    if (/^\|[\s:|-]+\|$/.test(trimmed)) continue
+    if (/^\|/.test(trimmed)) {
+      const first = trimmed.slice(1).split('|')[0].trim()
+      if (/^(产出物|项目|条目|路径)$/.test(first)) continue
+      outputs += 1
+      continue
+    }
+    if (/^(?:[-*]|\d+[.、])\s+/.test(trimmed)) outputs += 1
+  }
+  return { lines, outputs, score: lines + outputs * 3 }
+}
+
 /** 去掉列表序号与加粗标记，保留正文。 */
 function cleanItem(line) {
   return String(line).replace(/^\s*(?:\d+[.、]|[-*])\s+/, '').replace(/\*\*/g, '').trim()
@@ -749,13 +776,17 @@ async function readState(config) {
     names = []
   }
   const reports = []
-  for (const name of names.sort().reverse().slice(0, 90)) {
+  for (const name of names.sort().reverse().slice(0, 91)) {
     try {
       const content = await readFile(join(config.reportDir, name), 'utf8')
+      const stats = heatStats(content)
       reports.push({
         date: name.slice(3, 13),
         file: name,
         size: Buffer.byteLength(content, 'utf8'),
+        lines: stats.lines,
+        outputs: stats.outputs,
+        score: stats.score,
         content,
       })
     } catch {
@@ -787,6 +818,7 @@ async function readState(config) {
   }
   return {
     reportDir: config.reportDir,
+    today: dateInZone(config.scheduleTimeZone),
     updatedAt: new Date().toISOString(),
     board: {
       text: board.text,

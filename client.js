@@ -8,6 +8,14 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'dsh-work-summary'
     const ENDPOINT = '/dsh-work-summary/state'
     const SCHEDULE_ENDPOINT = '/dsh-work-summary/schedule'
+    // 4 档活跃度；0 档（无日报）用虚线边框表示，不占颜色。
+    const HEAT_COLORS = [
+      'rgba(47,158,68,.22)',
+      'rgba(47,158,68,.44)',
+      'rgba(47,158,68,.68)',
+      'rgba(47,158,68,.95)',
+    ]
+    const DAY_MS = 86400000
 
     const S = {
       page: {
@@ -64,6 +72,29 @@ window.__ModuleLoader__.load({
         background: open ? 'transparent' : 'rgba(127,127,127,.55)',
       }),
       empty: { opacity: 0.6, padding: '24px 0' },
+      heatCount: { fontSize: 13, opacity: 0.75, margin: '0 0 14px' },
+      heatGrid: { display: 'flex', gap: 10, alignItems: 'flex-start' },
+      heatWeekdays: { display: 'flex', flexDirection: 'column', gap: 3, paddingTop: 18 },
+      heatWeekday: { width: 16, height: 14, lineHeight: '14px', textAlign: 'right', fontSize: 10, opacity: 0.55 },
+      heatBody: { display: 'flex', flexDirection: 'column', gap: 4 },
+      heatMonths: { display: 'flex', gap: 3, height: 14 },
+      heatMonth: { width: 14, flex: '0 0 14px', fontSize: 10.5, lineHeight: '14px', opacity: 0.55, whiteSpace: 'nowrap' },
+      heatWeeks: { display: 'flex', gap: 3 },
+      heatWeek: { display: 'flex', flexDirection: 'column', gap: 3 },
+      heatCell: (level, future) => ({
+        boxSizing: 'border-box', width: 14, height: 14, padding: 0, borderRadius: 3,
+        border: level > 0 ? '1px solid transparent' : '1px solid rgba(127,127,127,.28)',
+        background: level > 0 ? HEAT_COLORS[level - 1] : 'transparent',
+        cursor: future ? 'default' : 'pointer',
+        opacity: future ? 0.35 : 1,
+      }),
+      heatLegend: { display: 'flex', alignItems: 'center', gap: 6, marginTop: 16, fontSize: 12, opacity: 0.8, flexWrap: 'wrap' },
+      heatSwatch: (level) => ({
+        width: 12, height: 12, borderRadius: 3, display: 'inline-block',
+        border: level > 0 ? '1px solid transparent' : '1px solid rgba(127,127,127,.28)',
+        background: level > 0 ? HEAT_COLORS[level - 1] : 'transparent',
+      }),
+      heatNotice: { marginTop: 12, fontSize: 13, opacity: 0.8 },
       error: { color: '#d14343', margin: '12px 0', whiteSpace: 'pre-wrap' },
       notice: { color: '#2f9e44', fontSize: 13 },
       field: { display: 'flex', alignItems: 'center', gap: 10, margin: '14px 0' },
@@ -130,6 +161,81 @@ window.__ModuleLoader__.load({
       return sections.filter(section => section.items.length > 0)
     }
 
+    function parseIsoDay(text) {
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(text || ''))
+      return match ? Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])) : NaN
+    }
+
+    function isoFromMs(ms) {
+      const date = new Date(ms)
+      const pad = value => String(value).padStart(2, '0')
+      return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`
+    }
+
+    function shiftIsoDay(date, delta) {
+      return isoFromMs(parseIsoDay(date) + delta * DAY_MS)
+    }
+
+    function mondayOffset(date) {
+      return (new Date(parseIsoDay(date)).getUTCDay() + 6) % 7
+    }
+
+    function localIsoDay() {
+      const now = new Date()
+      const pad = value => String(value).padStart(2, '0')
+      return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    }
+
+    // 最近 13 周（周一到周日），按当天热力值在样本里的四分位切成 4 档。
+    function buildHeat(state) {
+      const reports = state.reports || []
+      const byDate = new Map()
+      for (const report of reports) byDate.set(report.date, report)
+      const today = Number.isFinite(parseIsoDay(state.today)) ? state.today : localIsoDay()
+      const start = shiftIsoDay(today, -mondayOffset(today) - 12 * 7)
+      const scores = reports
+        .filter(report => report.date >= start && report.date <= today)
+        .map(report => Number(report.score) || 0)
+        .sort((a, b) => a - b)
+      const pick = (ratio) => {
+        if (scores.length === 0) return 0
+        return scores[Math.min(scores.length - 1, Math.floor((scores.length - 1) * ratio))]
+      }
+      const thresholds = [pick(0.25), pick(0.5), pick(0.75)]
+      const levelOf = (score) => {
+        if (!(score > 0)) return 0
+        let level = 1
+        for (const threshold of thresholds) if (score > threshold) level += 1
+        return level
+      }
+      const weeks = []
+      let previousMonth = ''
+      for (let week = 0; week < 13; week += 1) {
+        const days = []
+        for (let offset = 0; offset < 7; offset += 1) {
+          const date = shiftIsoDay(start, week * 7 + offset)
+          const report = byDate.get(date) || null
+          days.push({
+            date,
+            report,
+            future: date > today,
+            level: report ? levelOf(Number(report.score) || 0) : 0,
+          })
+        }
+        const month = days[0].date.slice(0, 7)
+        weeks.push({ days, label: month !== previousMonth ? `${Number(month.slice(5))}月` : '' })
+        previousMonth = month
+      }
+      const days = weeks.flatMap(week => week.days).filter(day => !day.future)
+      return {
+        today,
+        start,
+        weeks,
+        total: days.length,
+        covered: days.filter(day => day.report).length,
+      }
+    }
+
     function Icon(props) {
       const size = (props && props.size) || 16
       return h('svg', {
@@ -142,12 +248,18 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function ReportsView({ state }) {
+    function ReportsView({ state, focus, onFocusDone }) {
       const reports = state.reports || []
       const [selected, setSelected] = useState(reports.length > 0 ? reports[0].file : null)
       useEffect(() => {
         if (!reports.some(report => report.file === selected)) setSelected(reports.length > 0 ? reports[0].file : null)
       }, [reports, selected])
+      useEffect(() => {
+        if (!focus) return
+        const target = reports.find(report => report.date === focus)
+        if (target) setSelected(target.file)
+        onFocusDone()
+      }, [focus, reports, onFocusDone])
       const current = reports.find(report => report.file === selected)
       if (reports.length === 0) return h('div', { style: S.empty }, '这个目录里还没有日报。')
       return h('div', { style: S.split },
@@ -213,6 +325,70 @@ window.__ModuleLoader__.load({
           h('span', { style: item.open ? undefined : { opacity: 0.65 } }, item.text),
         )),
       )))
+    }
+
+    function HeatmapView({ state, onOpen }) {
+      const heat = buildHeat(state)
+      const [notice, setNotice] = useState(null)
+      if ((state.reports || []).length === 0) {
+        return h('div', { style: S.empty }, '还没有日报：写完第一份后，这里会按天亮起来。')
+      }
+
+      const tooltip = (day) => {
+        if (day.future) return `${day.date} · 还没到`
+        if (!day.report) return `${day.date} · 无日报`
+        return `${day.date} · ${day.report.lines} 行 · ${day.report.outputs} 条产出 · 强度 ${day.report.score}`
+      }
+
+      const clickCell = (day) => {
+        if (day.future) return
+        if (!day.report) {
+          setNotice(`该日无日报（${day.date}）`)
+          return
+        }
+        setNotice(null)
+        onOpen(day.date)
+      }
+
+      return h('div', null,
+        h('h3', { style: S.boardHead }, '贡献热力图'),
+        h('div', { style: S.heatCount },
+          `最近 13 周（${heat.start} ~ ${heat.today}），有日报 ${heat.covered} / ${heat.total} 天。点亮的格子点一下就到当天日报。`),
+        h('div', { style: S.heatGrid },
+          h('div', { style: S.heatWeekdays },
+            ['一', '', '三', '', '五', '', ''].map((label, index) => (
+              h('div', { key: index, style: S.heatWeekday }, label)
+            )),
+          ),
+          h('div', { style: S.heatBody },
+            h('div', { style: S.heatMonths },
+              heat.weeks.map((week, index) => h('div', { key: index, style: S.heatMonth }, week.label)),
+            ),
+            h('div', { style: S.heatWeeks },
+              heat.weeks.map((week, index) => h('div', { key: index, style: S.heatWeek },
+                week.days.map(day => h('button', {
+                  key: day.date,
+                  type: 'button',
+                  title: tooltip(day),
+                  'aria-label': tooltip(day),
+                  disabled: day.future,
+                  onClick: () => clickCell(day),
+                  style: S.heatCell(day.level, day.future),
+                })),
+              )),
+            ),
+          ),
+        ),
+        h('div', { style: S.heatLegend },
+          h('span', null, '图例：'),
+          h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+            h('span', { style: S.heatSwatch(0) }), '无日报'),
+          h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: 3 } },
+            [1, 2, 3, 4].map(level => h('span', { key: level, style: S.heatSwatch(level) }))),
+          h('span', null, '少 → 多（按当天行数 + 产出条数 × 3 分档）'),
+        ),
+        notice ? h('div', { style: S.heatNotice, role: 'status' }, notice) : null,
+      )
     }
 
     function SettingsView() {
@@ -427,7 +603,9 @@ window.__ModuleLoader__.load({
       const [state, setState] = useState(null)
       const [error, setError] = useState(null)
       const [tab, setTab] = useState('reports')
+      const [focusDate, setFocusDate] = useState(null)
       const [busy, setBusy] = useState(false)
+      const clearFocus = useCallback(() => setFocusDate(null), [])
 
       const load = useCallback(async () => {
         setBusy(true)
@@ -452,8 +630,9 @@ window.__ModuleLoader__.load({
           h('h1', { style: S.title }, '工作日报'),
           state ? h('span', { style: S.muted }, `${state.reportDir} · 待办 ${open} 条`) : null,
           h('div', { style: S.tabs },
-            h('button', { type: 'button', style: S.tab(tab === 'reports'), onClick: () => setTab('reports') }, '日报'),
+            h('button', { type: 'button', style: S.tab(tab === 'reports'), onClick: () => { setFocusDate(null); setTab('reports') } }, '日报'),
             h('button', { type: 'button', style: S.tab(tab === 'periods'), onClick: () => setTab('periods') }, '周期'),
+            h('button', { type: 'button', style: S.tab(tab === 'heatmap'), onClick: () => setTab('heatmap') }, '热力图'),
             h('button', { type: 'button', style: S.tab(tab === 'board'), onClick: () => setTab('board') }, '看板'),
             h('button', { type: 'button', style: S.tab(tab === 'settings'), onClick: () => setTab('settings') }, '设置'),
             h('button', { type: 'button', style: S.ghost, onClick: load, disabled: busy }, busy ? '刷新中…' : '刷新'),
@@ -462,8 +641,12 @@ window.__ModuleLoader__.load({
         error ? h('div', { style: S.error }, error) : null,
         tab === 'settings' ? h(SettingsView)
           : !state ? (error ? null : h('div', { style: S.empty }, '加载中…'))
-            : tab === 'reports' ? h(ReportsView, { state })
-              : tab === 'periods' ? h(PeriodsView, { state }) : h(BoardView, { state }),
+            : tab === 'reports' ? h(ReportsView, { state, focus: focusDate, onFocusDone: clearFocus })
+              : tab === 'periods' ? h(PeriodsView, { state })
+                : tab === 'heatmap' ? h(HeatmapView, {
+                  state,
+                  onOpen: (date) => { setFocusDate(date); setTab('reports') },
+                }) : h(BoardView, { state }),
       )
     }
 

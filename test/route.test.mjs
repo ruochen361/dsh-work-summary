@@ -1,9 +1,54 @@
 // 用假 ctx 驱动 index.js 的真实 apply：验证计划任务同步 + /dsh-work-summary/schedule 的 GET/POST。
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 
 // 数据根改到临时目录，别碰真实的 ~/.dsh/dsh-work-summary；设置也清空，保证从默认值开始。
 process.env.DSH_WORK_SUMMARY_HOME = 'F:\\dsh_plugins\\_probe\\home'
 rmSync('F:\\dsh_plugins\\_probe\\home\\settings.json', { force: true })
+
+// 热力图的数据来自 /state 里的日报正文统计；先放两份可预测的日报进去。
+const probeData = 'F:\\dsh_plugins\\_probe\\data'
+rmSync(probeData, { recursive: true, force: true })
+mkdirSync(probeData, { recursive: true })
+writeFileSync(`${probeData}\\日报-2026-11-25.md`, [
+  '# 工作日报 · 2026-11-25',
+  '',
+  '## 一、今日概览',
+  '',
+  '今天对齐了热力图的数据口径。',
+  '',
+  '## 二、做了什么',
+  '',
+  '- 梳理 state 结构',
+  '- 补统计函数',
+  '',
+  '## 三、结果与产出',
+  '',
+  '| 产出物 | 路径 | 状态 | 说明 |',
+  '|---|---|---|---|',
+  '| 热力图统计 | `index.js` | 完成 | `heatStats` |',
+  '| 页面热力图 | `client.js` | 完成 | 13 周网格 |',
+  '',
+  '## 四、风险与阻塞',
+  '',
+  '- 无。',
+  '',
+  '## 五、明日计划',
+  '',
+  '- 跑测试。',
+  '',
+  '## 六、明日开场清单',
+  '',
+  '- 跑 `npm test`。',
+  '',
+].join('\n'), 'utf8')
+writeFileSync(`${probeData}\\日报-2026-11-26.md`, [
+  '# 工作日报 · 2026-11-26',
+  '',
+  '## 一、今日概览',
+  '',
+  '短日报。',
+  '',
+].join('\n'), 'utf8')
 const { apply } = await import('../index.js')
 
 const realTask = {
@@ -71,6 +116,25 @@ console.log('prompt 已同步 =', Boolean(syncEdit), '| 仍含「返回 problems
 console.log('同步后首行 =', String(tasks[0].prompt).split('\n')[0])
 
 const route = routes.find(item => item.path === '/dsh-work-summary/schedule')
+
+// 热力图：/state 必须带上今天、逐日行数 / 产出条数 / 强度分。
+const stateRoute = routes.find(item => item.path === '/dsh-work-summary/state')
+const stateResponse = await stateRoute.resource()
+const statePayload = await stateResponse.json()
+const heatSample = statePayload.reports.find(report => report.date === '2026-11-25')
+const heatShort = statePayload.reports.find(report => report.date === '2026-11-26')
+console.log('热力图数据 =', JSON.stringify({
+  today: statePayload.today,
+  reports: statePayload.reports.length,
+  sample: heatSample && { lines: heatSample.lines, outputs: heatSample.outputs, score: heatSample.score },
+  short: heatShort && { lines: heatShort.lines, outputs: heatShort.outputs, score: heatShort.score },
+}))
+console.log('热力图校验 =',
+  /^\d{4}-\d{2}-\d{2}$/.test(statePayload.today)
+  && heatSample && heatSample.outputs === 2 && heatSample.score === heatSample.lines + 6
+  && heatShort && heatShort.outputs === 0 && heatShort.score === heatShort.lines
+    ? '通过'
+    : '不符合预期')
 
 async function call(method, body) {
   const req = {
