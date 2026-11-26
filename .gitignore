@@ -12,6 +12,12 @@ Thumbs.db
 # 若有人把 reportDir 指到仓库内，下面这些不该进版本库
 _源数据/
 日报-*.md
+周报-*.md
+月报-*.md
+周期-*.md
 看板.md
 _日志/
 settings.json
+
+# 测试临时目录
+test/.tmp-period/

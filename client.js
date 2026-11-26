@@ -170,6 +170,39 @@ window.__ModuleLoader__.load({
       )
     }
 
+    function PeriodsView({ state }) {
+      const periods = state.periods || []
+      const [selected, setSelected] = useState(periods.length > 0 ? periods[0].file : null)
+      useEffect(() => {
+        if (!periods.some(period => period.file === selected)) setSelected(periods.length > 0 ? periods[0].file : null)
+      }, [periods, selected])
+      const current = periods.find(period => period.file === selected)
+      if (periods.length === 0) return h('div', { style: S.empty }, '还没有周报或月报：生成时会写到日报目录下。')
+      const label = (period) => {
+        const badge = period.kind === 'month' ? '月' : period.kind === 'week' ? '周' : '期'
+        const short = period.kind === 'month' ? period.period : String(period.period).replace(/\d{4}-/g, '')
+        return `${badge} ${short}`
+      }
+      return h('div', { style: S.split },
+        h('div', { style: S.list }, periods.map(period => h('button', {
+          key: period.file,
+          type: 'button',
+          onClick: () => setSelected(period.file),
+          style: S.item(period.file === selected),
+          title: `${period.file} · ${Math.round(period.size / 102.4) / 10} KB`,
+        }, label(period)))),
+        h('div', { style: S.doc },
+          current
+            ? [
+              h('div', { key: 'meta', style: S.muted },
+                `${current.period} · ${Math.round(current.size / 102.4) / 10} KB · ${current.file}`),
+              ...current.content.split(/\r?\n/).map(renderLine),
+            ]
+            : h('div', { style: S.empty }, '选一份周期报告看。'),
+        ),
+      )
+    }
+
     function BoardView({ state }) {
       const sections = parseBoard(state.board && state.board.text)
       if (sections.length === 0) return h('div', { style: S.empty }, '看板里还没有条目。')
@@ -185,6 +218,10 @@ window.__ModuleLoader__.load({
     function SettingsView() {
       const [info, setInfo] = useState(null)
       const [time, setTime] = useState('23:00')
+      const [weekTime, setWeekTime] = useState('01:00')
+      const [monthTime, setMonthTime] = useState('01:00')
+      const [weekActive, setWeekActive] = useState(true)
+      const [monthActive, setMonthActive] = useState(true)
       const [reportDir, setReportDir] = useState('')
       const [workspace, setWorkspace] = useState('')
       const [logDir, setLogDir] = useState('')
@@ -192,21 +229,33 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = useState(null)
       const [error, setError] = useState(null)
 
+      const applyPayload = useCallback((payload) => {
+        if (payload.time) setTime(payload.time)
+        if (typeof payload.reportDir === 'string') setReportDir(payload.reportDir)
+        if (typeof payload.workspace === 'string') setWorkspace(payload.workspace)
+        if (typeof payload.logDir === 'string') setLogDir(payload.logDir)
+        if (payload.week) {
+          if (payload.week.time) setWeekTime(payload.week.time)
+          if (typeof payload.week.active === 'boolean') setWeekActive(payload.week.active)
+        }
+        if (payload.month) {
+          if (payload.month.time) setMonthTime(payload.month.time)
+          if (typeof payload.month.active === 'boolean') setMonthActive(payload.month.active)
+        }
+      }, [])
+
       const load = useCallback(async () => {
         try {
           const response = await fetch(SCHEDULE_ENDPOINT, { cache: 'no-store' })
           const payload = await response.json()
           if (!response.ok) throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`)
           setInfo(payload)
-          if (payload.time) setTime(payload.time)
-          if (typeof payload.reportDir === 'string') setReportDir(payload.reportDir)
-          if (typeof payload.workspace === 'string') setWorkspace(payload.workspace)
-          if (typeof payload.logDir === 'string') setLogDir(payload.logDir)
+          applyPayload(payload)
           setError(null)
         } catch (cause) {
           setError(`读取定时设置失败：${cause && cause.message ? cause.message : String(cause)}`)
         }
-      }, [])
+      }, [applyPayload])
 
       useEffect(() => { load() }, [load])
 
@@ -223,23 +272,20 @@ window.__ModuleLoader__.load({
           const payload = await response.json()
           if (!response.ok) throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`)
           setInfo(payload)
-          if (payload.time) setTime(payload.time)
-          if (typeof payload.reportDir === 'string') setReportDir(payload.reportDir)
-          if (typeof payload.workspace === 'string') setWorkspace(payload.workspace)
-          if (typeof payload.logDir === 'string') setLogDir(payload.logDir)
+          applyPayload(payload)
           setNotice('已保存')
         } catch (cause) {
           setError(`保存失败：${cause && cause.message ? cause.message : String(cause)}`)
         } finally {
           setBusy(false)
         }
-      }, [])
+      }, [applyPayload])
 
       if (!info) return error ? h('div', { style: S.error }, error) : h('div', { style: S.empty }, '加载中…')
 
       const scheduleBlock = info.found
         ? h('div', null,
-          h('h3', { style: S.boardHead }, '定时'),
+          h('h3', { style: S.boardHead }, '日报定时'),
           h('div', { style: S.field },
             h('span', { style: S.label }, '每天'),
             h('input', {
@@ -266,6 +312,47 @@ window.__ModuleLoader__.load({
           ),
         )
         : h('div', { style: S.empty }, '还没找到日报计划任务：重启一次 DSH，插件会把它建出来。')
+
+      const periodBlock = (label, ruleText, sub, timeValue, setTimeValue, timeField, activeField, activeValue, setActiveValue) => {
+        if (!sub || !sub.found) {
+          return h('div', { key: label },
+            h('h3', { style: S.boardHead }, `${label}定时`),
+            h('div', { style: S.empty }, `还没找到${label}计划任务：重启一次 DSH，开关打开时会按设置建出来。`),
+          )
+        }
+        return h('div', { key: label },
+          h('h3', { style: S.boardHead }, `${label}定时`),
+          h('div', { style: S.field },
+            h('span', { style: S.label }, '规则'),
+            h('span', { style: S.muted }, ruleText),
+          ),
+          h('div', { style: S.field },
+            h('span', { style: S.label }, '时间'),
+            h('input', {
+              type: 'time',
+              value: timeValue,
+              style: S.input,
+              onChange: event => setTimeValue(event.target.value),
+            }),
+            h('button', { type: 'button', style: S.ghost, disabled: busy, onClick: () => save({ [timeField]: timeValue }) },
+              busy ? '保存中…' : '保存时间'),
+            h('span', { style: S.muted }, sub.timeZone),
+          ),
+          h('div', { style: S.field },
+            h('span', { style: S.label }, '启用'),
+            h('input', {
+              type: 'checkbox',
+              checked: Boolean(activeValue),
+              onChange: (event) => {
+                setActiveValue(event.target.checked)
+                save({ [activeField]: event.target.checked })
+              },
+            }),
+            h('span', { style: S.muted }, activeValue ? '到点生成并投递' : '已暂停，任务仍保留'),
+          ),
+          sub.nextRunAt ? h('div', { style: S.hint }, `下次触发：${sub.nextRunAt}`) : null,
+        )
+      }
 
       return h('div', { style: { maxWidth: 640 } },
         h('h3', { style: S.boardHead }, '日报文件目录'),
@@ -301,6 +388,10 @@ window.__ModuleLoader__.load({
           '日报从这里扫当天改了哪些文件、有哪些 git 仓库；默认和插件数据目录同一个（装好就有），填你平时干活的目录更贴合实际。',
         ),
         scheduleBlock,
+        periodBlock('周报', '每周一生成上一周（周一至周日）', info.week,
+          weekTime, setWeekTime, 'weekTime', 'weekActive', weekActive, setWeekActive),
+        periodBlock('月报', '每月 1 号生成上一个自然月', info.month,
+          monthTime, setMonthTime, 'monthTime', 'monthActive', monthActive, setMonthActive),
         h('h3', { style: S.boardHead }, '日志'),
         h('div', { style: S.field },
           h('span', { style: S.label }, '目录'),
@@ -326,7 +417,7 @@ window.__ModuleLoader__.load({
             h('br'),
             info.nextRunAt ? `下次触发：${info.nextRunAt}` : '当前没有下次触发时间',
             h('br'),
-            '时间改的是计划任务本身，重启后不会被默认值盖回去；暂停只停投递，不删任务。',
+            '日报时间改的是任务本身，重启后不会被 scheduleTime 默认值盖回去；周报 / 月报的时间会同时记住。暂停只停投递，不删任务。',
           )
           : null,
       )
@@ -362,6 +453,7 @@ window.__ModuleLoader__.load({
           state ? h('span', { style: S.muted }, `${state.reportDir} · 待办 ${open} 条`) : null,
           h('div', { style: S.tabs },
             h('button', { type: 'button', style: S.tab(tab === 'reports'), onClick: () => setTab('reports') }, '日报'),
+            h('button', { type: 'button', style: S.tab(tab === 'periods'), onClick: () => setTab('periods') }, '周期'),
             h('button', { type: 'button', style: S.tab(tab === 'board'), onClick: () => setTab('board') }, '看板'),
             h('button', { type: 'button', style: S.tab(tab === 'settings'), onClick: () => setTab('settings') }, '设置'),
             h('button', { type: 'button', style: S.ghost, onClick: load, disabled: busy }, busy ? '刷新中…' : '刷新'),
@@ -370,7 +462,8 @@ window.__ModuleLoader__.load({
         error ? h('div', { style: S.error }, error) : null,
         tab === 'settings' ? h(SettingsView)
           : !state ? (error ? null : h('div', { style: S.empty }, '加载中…'))
-            : tab === 'reports' ? h(ReportsView, { state }) : h(BoardView, { state }),
+            : tab === 'reports' ? h(ReportsView, { state })
+              : tab === 'periods' ? h(PeriodsView, { state }) : h(BoardView, { state }),
       )
     }
 

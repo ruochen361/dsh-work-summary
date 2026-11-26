@@ -1,8 +1,9 @@
 // 用假 ctx 驱动 index.js 的真实 apply：验证计划任务同步 + /dsh-work-summary/schedule 的 GET/POST。
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 
-// 数据根改到临时目录，别碰真实的 ~/.dsh/dsh-work-summary。
+// 数据根改到临时目录，别碰真实的 ~/.dsh/dsh-work-summary；设置也清空，保证从默认值开始。
 process.env.DSH_WORK_SUMMARY_HOME = 'F:\\dsh_plugins\\_probe\\home'
+rmSync('F:\\dsh_plugins\\_probe\\home\\settings.json', { force: true })
 const { apply } = await import('../index.js')
 
 const realTask = {
@@ -30,8 +31,19 @@ const schedule = {
     return task
   },
   create: async (input) => {
+    const task = {
+      id: `schedule-new-${tasks.length + 1}`,
+      kind: 'rrule',
+      title: input.title,
+      prompt: input.prompt,
+      rrule: input.timing?.rrule ?? '',
+      status: 'active',
+      scheduledAtLocal: null,
+      target: input.target,
+    }
+    tasks.push(task)
     edits.push({ created: input })
-    return input
+    return task
   },
 }
 
@@ -53,6 +65,7 @@ await new Promise(resolve => setTimeout(resolve, 60))
 
 console.log('tools =', tools.map(item => item.name).join(','))
 console.log('routes =', routes.map(item => item.path).join(','))
+console.log('计划任务 =', tasks.map(item => `${item.title}(${item.status})`).join(' | '))
 const syncEdit = edits.find(item => item.patch && typeof item.patch.prompt === 'string')
 console.log('prompt 已同步 =', Boolean(syncEdit), '| 仍含「返回 problems」 =', String(tasks[0].prompt).includes('返回 problems'))
 console.log('同步后首行 =', String(tasks[0].prompt).split('\n')[0])
@@ -82,6 +95,10 @@ console.log('GET#1 =', first.status, JSON.stringify({
   found: first.json.found, time: first.json.time, active: first.json.active,
   tz: first.json.timeZone, id: first.json.id, next: first.json.nextRunAt,
 }))
+console.log('周期任务 =', JSON.stringify({
+  week: first.json.week && { found: first.json.week.found, time: first.json.week.time, active: first.json.week.active },
+  month: first.json.month && { found: first.json.month.found, time: first.json.month.time, active: first.json.month.active },
+}))
 
 const changed = await call('POST', { time: '07:30' })
 console.log('POST 07:30 =', changed.status, JSON.stringify({
@@ -103,6 +120,26 @@ console.log('POST active:false =', paused.status, JSON.stringify({ active: pause
 
 const resumed = await call('POST', { active: true })
 console.log('POST active:true =', resumed.status, JSON.stringify({ active: resumed.json.active }))
+
+const weekChanged = await call('POST', { weekTime: '08:15' })
+console.log('POST weekTime =', weekChanged.status, JSON.stringify({
+  time: weekChanged.json.week && weekChanged.json.week.time,
+  rrule: weekChanged.json.week && tasks.find(item => item.title === '每周工作周报')?.rrule,
+}))
+
+const weekPaused = await call('POST', { weekActive: false })
+console.log('POST weekActive:false =', weekPaused.status, JSON.stringify({
+  active: weekPaused.json.week && weekPaused.json.week.active,
+}))
+
+const monthChanged = await call('POST', { monthTime: '08:45' })
+console.log('POST monthTime =', monthChanged.status, JSON.stringify({
+  time: monthChanged.json.month && monthChanged.json.month.time,
+  rrule: monthChanged.json.month && tasks.find(item => item.title === '每月工作月报')?.rrule,
+}))
+
+const badWeek = await call('POST', { weekTime: '8:15' })
+console.log('POST weekTime 8:15 =', badWeek.status, JSON.stringify(badWeek.json))
 
 const rejected = await call('DELETE')
 console.log('DELETE =', rejected.status)
@@ -144,4 +181,20 @@ console.log('工作空间目录已建 =', existsSync('F:\\dsh_plugins\\_probe\\w
 
 const badWs = await call('POST', { workspace: 'work' })
 console.log('POST workspace 相对路径 =', badWs.status, JSON.stringify(badWs.json))
+
+// 周期聚合的非法区间：必须在跑脚本之前就拒绝，不能写任何文件。
+const period = tools.find(item => item.name === 'work_summary_period')
+console.log('period 工具 =', Boolean(period))
+for (const [label, args, pattern] of [
+  ['周期 from>to', { from: '2026-11-24', to: '2026-11-18' }, /结束日期不能早于起始日期/],
+  ['周期 跨 400 天', { from: '2025-01-01', to: '2026-11-24' }, /最长 400 天/],
+]) {
+  try {
+    await period.execute(args, {})
+    console.log(label, '= 未报错（不符合预期）')
+  } catch (error) {
+    const message = String(error && error.message ? error.message : error)
+    console.log(label, '=', pattern.test(message) ? '已拒绝' : `报错不符：${message}`)
+  }
+}
 

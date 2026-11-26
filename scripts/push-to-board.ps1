@@ -6,15 +6,18 @@
 # 用法：
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ~\.dsh\dsh-work-summary\看板.md -Show
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ~\.dsh\dsh-work-summary\看板.md -Report ~\.dsh\dsh-work-summary\日报-2026-10-29.md
+#   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Report ...\周报-2026-11-18_2026-11-24.md -Section 下周开场
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -DryRun          # 只解析不写入
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Done "git init" # 移到「已完成」
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Drop "git init" # 移到「已放弃」
 #
 # 去重：同一标题（条目取前 36 字）已在看板任意一栏出现时跳过。
+# 小节名由 -Section 指定：日报默认「明日开场清单」，周报/月报传「下周开场」「下月开场」。
 
 param(
   [string]$Report,
   [string]$BoardPath,
+  [string]$Section = '明日开场清单',
   [string]$Done,
   [string]$Drop,
   [switch]$DryRun,
@@ -139,7 +142,7 @@ if ($mode) {
   return
 }
 
-# ---------- 从日报解析「明日开场清单」 ----------
+# ---------- 从日报/周报解析指定小节（默认「明日开场清单」） ----------
 if (-not $Report) {
   $Report = (Get-ChildItem (Split-Path -Parent $BoardPath) -Filter '日报-*.md' -File |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
@@ -148,10 +151,11 @@ if (-not $Report -or -not (Test-Path $Report)) { throw "找不到日报文件：
 
 $lines = Get-Content $Report -Encoding UTF8
 $start = -1
+$sectionPattern = '^##\s.*' + [regex]::Escape($Section)
 for ($i = 0; $i -lt $lines.Count; $i++) {
-  if ($lines[$i] -match '^##\s.*明日开场清单') { $start = $i + 1; break }
+  if ($lines[$i] -match $sectionPattern) { $start = $i + 1; break }
 }
-if ($start -lt 0) { throw "日报里没有「明日开场清单」小节：$Report" }
+if ($start -lt 0) { throw "日报里没有「$Section」小节：$Report" }
 
 $items = @()
 for ($i = $start; $i -lt $lines.Count; $i++) {
@@ -162,7 +166,7 @@ for ($i = $start; $i -lt $lines.Count; $i++) {
     if ($t -notmatch '^(✅|\[x\])' -and $t -notmatch '已完成') { $items += $t }
   }
 }
-if ($items.Count -eq 0) { throw "「明日开场清单」里没有解析到条目：$Report" }
+if ($items.Count -eq 0) { throw "「$Section」里没有解析到条目：$Report" }
 
 Write-Output ("解析到 {0} 条待办：来自 {1}" -f $items.Count, $Report)
 foreach ($it in $items) { Write-Output ('  - ' + $it) }
@@ -205,7 +209,7 @@ foreach ($it in $items) {
   $added++
 }
 
-if ($added -eq 0) { Write-Output '没有新条目需要写入（全部已存在）。'; return }
+if ($added -eq 0) { Write-Output ("已写入 0 条，跳过重复 {0} 条 → {1}" -f $skipped.Count, $BoardPath); return }
 if ($DryRun) {
   Write-Output ("DryRun：将写入 {0} 条：" -f $added)
   $newLines | ForEach-Object { Write-Output $_ }
