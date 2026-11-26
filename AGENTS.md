@@ -7,7 +7,7 @@
 `dsh-work-summary` 是 DeepSeek Harness（DSH）插件，由三部分组成：
 
 - **Host** `index.js`：ESM，注册工具、HTTP 路由、计划任务；不直接读写浏览器。
-- **浏览器半** `client.js`：通过 `window.__ModuleLoader__.load(...)` 挂侧边栏「日报」页面，含日报、周期、热力图、看板、设置五个视图。
+- **浏览器半** `client.js`：通过 `window.__ModuleLoader__.load(...)` 挂侧边栏「日报」页面，含看板、日报、周期、统计、设置五个视图，默认落在看板；统计页含热力图、产出趋势与看板交付结构。
 - **脚本半** `scripts/*.ps1`：PowerShell 7 采集与看板操作，由 Host 通过 `pwsh` 调用。
 
 运行期数据默认在 `~/.dsh/dsh-work-summary`，不属于代码仓库。不要 import `@deepseek-ai/*`：插件按本地 link 安装，没有 `node_modules`。
@@ -20,12 +20,14 @@
 | `client.js` | 侧边栏面板与设置页 |
 | `scripts/collect-day.ps1` | 单日采集，写 `_源数据/YYYY-MM-DD.md`；超过 60 个按季度归档到 `_归档` |
 | `scripts/collect-range.ps1` | 区间采集，写 `_源数据/周期-from_to.md` |
-| `scripts/push-to-board.ps1` | 日报/周报/月报的末节推看板，按指纹去重 |
+| `scripts/push-to-board.ps1` | 日报/周报/月报的末节推看板，按指纹去重；也可改条目优先级/截止日/状态 |
 | `PROMPT.md` | 日报/周期正文规则，运行期读取 |
-| `test/route.test.mjs` | 假 ctx 驱动 Host：工具、路由、计划任务、参数校验 |
+| `test/route.test.mjs` | 假 ctx 驱动 Host：工具、路由、计划任务、参数校验、热力图统计、看板写回 |
 | `test/period.test.mjs` | 周期聚合：四节、命名、offset、看板去重、拒绝非法区间 |
 | `test/quality.test.mjs` | 质量软校验：空话/缺证据仍落盘、正常日报零提醒、阈值配置 |
 | `test/archive.test.mjs` | 源数据归档：保留 60 个、季度包字节一致、失败不阻断 |
+| `test/board-start.test.mjs` | 看板开工：提示词、当前工作区选择、建会话并发送、拒绝原因、无工作区 |
+| `test/stats.test.mjs` | 统计页：趋势补零、7 日均值、默认 30 天窗口、看板交付计数、空看板、渲染冒烟 |
 | `docs/DETAIL.md` | 机制与配置细节 |
 | `docs/ROADMAP.md` | 需求清单，一需求一 ID |
 
@@ -33,11 +35,13 @@
 
 ```powershell
 npm run check                      # node --check index.js && node --check client.js
-npm test                           # route + period + quality + archive 四份测试
+npm test                           # stats + board-start + route + period + quality + archive 六份测试
 node test/route.test.mjs           # 单跑
 node test/period.test.mjs          # 单跑
 node test/quality.test.mjs         # 单跑
 node test/archive.test.mjs         # 单跑
+node test/board-start.test.mjs      # 单跑
+node test/stats.test.mjs            # 单跑
 ```
 
 测试会启动 `pwsh`。在 DSH 沙箱里，受限模式会因命名管道报 `Access to the path '\\.\pipe\LOCAL\dotnet_...' is denied`，需要以完整权限运行。测试使用 `test/.tmp-period`、`test/.tmp-quality`、`test/.tmp-archive` 与 `_probe` 作为临时根，不要指向真实的 `~/.dsh/dsh-work-summary`。
@@ -50,7 +54,8 @@ node test/archive.test.mjs         # 单跑
 - 周区间以周一为起点；计划任务时间使用 `scheduleTimeZone`（默认 `Asia/Shanghai`），「今天」用 `dateInZone`。
 - 日报固定六节（`SECTIONS`），周报/月报固定四节；缺节、正文过短、含 `TODO`/`待填`/`{{` 必须在写文件前抛错。
 - 日报质量软校验只返回 `warnings` 并拼进 `text`，不得阻断落盘；阈值 `quality.minEvidence` 默认 3，支持嵌套与扁平点号键。
-- 看板按标题/条目指纹去重；周报/月报推最后一节，调用 `push-to-board.ps1 -Section <末节名>`。
+- 看板按标题/条目指纹去重；周报/月报推最后一节，调用 `push-to-board.ps1 -Section <末节名>`。条目优先级/截止日/状态用 `-Update` 改，页面走 `POST /dsh-work-summary/board`。
+- 看板「开工」是纯客户端：当前工作区 `sessions.create` → `sessions.using` 里 `session.prompt(..., 'queue')` 确认发送成功 → `uiWorkspace.openSession`；不改 Host 路由与看板文件。
 - 计划任务按标题识别。日报的 `findOwnTask` 会排除提示词含 `work_summary_period` 的任务；周期提示词不要写 `dsh-work-summary`，否则可能被日报认领。
 - 测试与脚本不得写入真实数据目录；临时文件放 `test/`、`_probe/`，并确认已在 `.gitignore` 中。
 

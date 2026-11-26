@@ -15,7 +15,7 @@ DeepSeek Harness 插件：定时生成日报、周报、月报。采集、结构
 - 每周一 01:00 生成上一周周报，每月 1 号 01:00 生成上一个自然月月报。
 - 缺节、空骨架、占位符直接报错且不写文件；同一区间连跑两次，看板不重复。
 - 保存日报时顺带做质量软提醒：路径/提交号太少、空话词、建议不可执行只提示，不阻断落盘。
-- 侧边栏内置「日报」页面：读日报、看周报/月报、看待办、看最近 13 周贡献热力图、改定时与目录。
+- 侧边栏内置「日报」页面，默认打开看板：看待办并一键开工、调优先级与截止日，读日报、看周报/月报、在「统计」里看 13 周热力图、30 天产出趋势与看板交付结构、改定时与目录。
 
 ## 安装
 
@@ -32,7 +32,7 @@ plugin_manager install_bundle dsh-work-summary
 | `daily_report_collect` | 采集当天痕迹，返回源数据路径与六节模板；超 60 个自动归档 |
 | `daily_report_save` | 校验六节 → 写日报 → 推看板；返回质量 `warnings`（只提醒） |
 | `work_summary_period` | 聚合区间，写周报/月报并推看板；`offset: 1` 取上一周期 |
-| `daily_report_board` | `show` 未完成，`done` / `drop` 回写看板 |
+| `daily_report_board` | `show` 未完成，`done` / `drop` 回写看板，`update` 改优先级 / 截止日 / 状态 |
 
 ## 配置
 
@@ -68,7 +68,7 @@ plugin_manager install_bundle dsh-work-summary
 
 ```bash
 npm run check   # node --check index.js / client.js
-npm test        # 假 ctx 驱动工具、路由、计划任务、周期聚合、质量软校验与归档
+npm test        # 假 ctx 驱动工具、路由、计划任务、周期聚合、质量软校验、归档与看板开工
 ```
 
 测试会启动 `pwsh`，在受限沙箱里需完整权限。仓库：`index.js`（Host）、`client.js`（侧边栏）、`scripts/*.ps1`（采集/看板）、`PROMPT.md`（正文规则）。

@@ -748,6 +748,71 @@ async function readBoard(reportDir) {
 }
 
 /**
+ * 校验并归一化看板更新参数：优先级、截止日、状态三者至少给一个。
+ * @param {{ priority?: unknown, due?: unknown, status?: unknown }} input - 原始参数。
+ * @returns {{ priority?: string, due?: string, status?: string }} 可传给脚本的参数。
+ */
+function boardPatch(input) {
+  const patch = {}
+  if (input.priority !== undefined) {
+    const value = String(input.priority).trim().toUpperCase()
+    if (!['P1', 'P2', 'P3', 'NONE'].includes(value)) throw new Error('priority 只能是 P1 / P2 / P3 / none')
+    patch.priority = value === 'NONE' ? 'none' : value
+  }
+  if (input.due !== undefined) {
+    const value = String(input.due).trim()
+    if (value.toLowerCase() !== 'none') parseDay(value)
+    patch.due = value.toLowerCase() === 'none' ? 'none' : value
+  }
+  if (input.status !== undefined) {
+    const value = String(input.status).trim().toLowerCase()
+    if (!['todo', 'doing', 'done', 'drop'].includes(value)) {
+      throw new Error('status 只能是 todo / doing / done / drop')
+    }
+    patch.status = value
+  }
+  if (Object.keys(patch).length === 0) throw new Error('update 至少要给 priority / due / status 之一')
+  return patch
+}
+
+/**
+ * 调 push-to-board.ps1 改一条看板条目的优先级、截止日或状态。
+ * @param {typeof DEFAULTS} config - 生效配置。
+ * @param {string} keyword - 标题关键词或 #h 指纹。
+ * @param {{ priority?: string, due?: string, status?: string }} patch - 更新参数。
+ * @param {AbortSignal | undefined} signal - 取消信号。
+ * @returns {Promise<{ stdout: string, board: { open: string[], text: string } }>} 脚本输出与更新后的看板。
+ */
+async function updateBoard(config, keyword, patch, signal) {
+  const args = ['-Update', keyword, '-BoardPath', boardPathOf(config)]
+  if (patch.priority !== undefined) args.push('-Priority', patch.priority)
+  if (patch.due !== undefined) args.push('-Due', patch.due)
+  if (patch.status !== undefined) args.push('-Status', patch.status)
+  const result = await runScript(config, 'push-to-board.ps1', args, signal)
+  if (result.code !== 0) {
+    throw new Error(`更新看板失败（退出码 ${result.code}）：\n${tail(result.stderr || result.stdout)}`)
+  }
+  return { stdout: result.stdout.trim(), board: await readBoard(config.reportDir) }
+}
+
+/**
+ * 读取 POST body；空 body 当 {}，非法 JSON 由调用方转成 400。
+ * @param {import('node:http').IncomingMessage} req - 请求。
+ * @returns {Promise<Record<string, unknown>>} 解析后的 body。
+ */
+async function readJsonBody(req) {
+  const chunks = []
+  for await (const chunk of req) chunks.push(chunk)
+  const raw = Buffer.concat(chunks).toString('utf8')
+  if (raw.trim() === '') return {}
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error('请求体不是合法 JSON')
+  }
+}
+
+/**
  * 取输出末尾若干行用于报错。
  * @param {string} text - 进程输出。
  * @returns {string} 截断后的输出。
@@ -764,6 +829,7 @@ function tail(text) {
  */
 const PS_SWITCHES = new Set([
   '-Date', '-From', '-To', '-Section', '-NoSessions', '-Report', '-BoardPath', '-Show', '-Done', '-Drop', '-DryRun',
+  '-Update', '-Priority', '-Due', '-Status',
   '-Workspace', '-ReportDir', '-DshHome',
 ])
 
@@ -1348,14 +1414,18 @@ export function apply(ctx, rawConfig) {
     name: 'daily_report_board',
     description:
       '查看或维护工作看板（_日报\\看板.md）。show 列出未完成待办；done 把匹配的待办移到「已完成」；'
-      + 'drop 把决定不做的移到「已放弃」（不是完成）。done/drop 需要 keyword，按标题子串匹配。',
+      + 'drop 把决定不做的移到「已放弃」（不是完成）；update 改一条的优先级、截止日或状态。'
+      + 'done/drop/update 需要 keyword（标题子串，或条目里的 #h 指纹）。',
     parameters: {
       type: 'object',
       additionalProperties: false,
       required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['show', 'done', 'drop'], description: 'show | done | drop。' },
-        keyword: { type: 'string', description: 'done/drop 必填，待办标题里的关键词。' },
+        action: { type: 'string', enum: ['show', 'done', 'drop', 'update'], description: 'show | done | drop | update。' },
+        keyword: { type: 'string', description: 'done/drop/update 必填，待办标题里的关键词或 #h 指纹。' },
+        priority: { type: 'string', enum: ['P1', 'P2', 'P3', 'none'], description: 'update 可选：优先级，none 表示清空。' },
+        due: { type: 'string', description: 'update 可选：截止日 YYYY-MM-DD，none 表示清空。' },
+        status: { type: 'string', enum: ['todo', 'doing', 'done', 'drop'], description: 'update 可选：目标状态，省略则只改元数据。' },
       },
     },
     output: {
@@ -1367,6 +1437,7 @@ export function apply(ctx, rawConfig) {
           action: { type: 'string' },
           openCount: { type: 'integer' },
           open: { type: 'array', items: { type: 'string' } },
+          updated: { type: 'string' },
           text: { type: 'string' },
         },
       },
@@ -1374,8 +1445,21 @@ export function apply(ctx, rawConfig) {
     },
     async execute(args, exec) {
       const action = args.action
-      if (action !== 'show' && action !== 'done' && action !== 'drop') {
+      if (!['show', 'done', 'drop', 'update'].includes(action)) {
         throw new Error(`未知动作：${action}`)
+      }
+      if (action === 'update') {
+        const keyword = String(args.keyword ?? '').trim()
+        if (keyword === '') throw new Error('update 需要 keyword')
+        const patch = boardPatch(args)
+        const { stdout, board } = await updateBoard(config, keyword, patch, exec.signal)
+        return {
+          action,
+          openCount: board.open.length,
+          open: board.open,
+          updated: stdout,
+          text: `${stdout}\n未完成 ${board.open.length} 条。`.trim(),
+        }
       }
       if (action !== 'show') {
         const keyword = String(args.keyword ?? '').trim()
@@ -1412,7 +1496,7 @@ export function apply(ctx, rawConfig) {
 
   // 侧边栏「日报」页面读的数据：只读、同源、不缓存。Host 没接 Web 服务时这段自动缺席。
   ctx.inject(['webServer'], (webCtx) => {
-    const dispose = webCtx.webServer.register({
+    const stateDispose = webCtx.webServer.register({
       kind: 'exact',
       path: '/dsh-work-summary/state',
       resource: async () => {
@@ -1429,7 +1513,38 @@ export function apply(ctx, rawConfig) {
         }
       },
     })
-    return () => { if (typeof dispose === 'function') dispose() }
+
+    // 看板页是唯一允许写文件的页面入口：只改条目元数据/状态，不碰日报正文。
+    const boardDispose = webCtx.webServer.register({
+      kind: 'exact',
+      path: '/dsh-work-summary/board',
+      handler: async (req, res) => {
+        const send = (status, value) => {
+          res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify(value))
+        }
+        try {
+          if (req.method !== 'POST') {
+            res.writeHead(405, { allow: 'POST' })
+            res.end()
+            return
+          }
+          const body = await readJsonBody(req)
+          const keyword = String(body.keyword ?? '').trim()
+          if (keyword === '') throw new Error('keyword 不能为空：写标题关键词或条目里的 #h 指纹')
+          const patch = boardPatch(body)
+          const { stdout, board } = await updateBoard(config, keyword, patch)
+          send(200, { updated: stdout, openCount: board.open.length })
+        } catch (error) {
+          send(400, { error: String(error?.message ?? error) })
+        }
+      },
+    })
+
+    return () => {
+      if (typeof stateDispose === 'function') stateDispose()
+      if (typeof boardDispose === 'function') boardDispose()
+    }
   })
 
   // 设置页：读/改那条日报计划任务。任务的 rrule 就是唯一真源，不另存一份配置。

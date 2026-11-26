@@ -49,6 +49,27 @@ writeFileSync(`${probeData}\\日报-2026-11-26.md`, [
   '短日报。',
   '',
 ].join('\n'), 'utf8')
+
+// 看板：老格式 + 新元数据 + 已完成条目，覆盖解析、改元数据、跨栏移动。
+writeFileSync(`${probeData}\\看板.md`, [
+  '# 工作看板',
+  '',
+  '## 待办',
+  '',
+  '- [ ] 2026-11-20 ｜ 老格式条目 ｜ 来源：日报-2026-11-20.md ｜ #h11111111',
+  '  - 详情：老格式条目正文',
+  '- [ ] 2026-11-21 ｜ 待设优先级 ｜ 来源：日报-2026-11-21.md ｜ #h22222222 ｜ @P2 ｜ !2026-11-30',
+  '  - 详情：待设优先级正文',
+  '',
+  '## 进行中',
+  '',
+  '## 已完成',
+  '',
+  '- [x] 2026-11-01 ｜ 已完成条目 ｜ 来源：日报-2026-11-01.md ｜ #h33333333（完成 2026-11-02）',
+  '',
+  '## 已放弃',
+  '',
+].join('\n'), 'utf8')
 const { apply } = await import('../index.js')
 
 const realTask = {
@@ -135,6 +156,81 @@ console.log('热力图校验 =',
   && heatShort && heatShort.outputs === 0 && heatShort.score === heatShort.lines
     ? '通过'
     : '不符合预期')
+
+// 看板写回：老格式解析、元数据更新、跨栏移动、错误拒绝、重复更新幂等。
+const boardRoute = routes.find(item => item.path === '/dsh-work-summary/board')
+const boardFile = `${probeData}\\看板.md`
+const readBoard = () => readFileSync(boardFile, 'utf8')
+function check(condition, message) {
+  if (!condition) throw new Error(`看板断言失败：${message}`)
+}
+async function callBoard(method, body) {
+  const req = {
+    method,
+    [Symbol.asyncIterator]: async function* () {
+      if (body !== undefined) yield Buffer.from(typeof body === 'string' ? body : JSON.stringify(body), 'utf8')
+    },
+  }
+  let status = 0
+  let payload = ''
+  const res = {
+    writeHead(code) { status = code },
+    end(chunk) { payload = chunk === undefined ? '' : String(chunk) },
+  }
+  await boardRoute.handler(req, res)
+  return { status, json: payload ? JSON.parse(payload) : null }
+}
+
+const boardGet = await callBoard('GET')
+check(boardGet.status === 405, `GET 应 405，实际 ${boardGet.status}`)
+
+const noPatch = await callBoard('POST', { keyword: '老格式条目' })
+check(noPatch.status === 400 && /至少要给/.test(noPatch.json.error), '空 patch 应 400')
+
+const missing = await callBoard('POST', { keyword: '没有这条', priority: 'P1' })
+check(missing.status === 400 && /没有匹配/.test(missing.json.error), '未知条目应 400')
+
+const oldMeta = await callBoard('POST', { keyword: '老格式条目', priority: 'p1', due: '2026-12-15' })
+check(oldMeta.status === 200, `老格式更新应 200，实际 ${oldMeta.status} ${JSON.stringify(oldMeta.json)}`)
+let boardText = readBoard()
+check(/老格式条目.*@P1.*!2026-12-15/.test(boardText), '老格式条目应写入 @P1 与截止日')
+check(boardText.includes('  - 详情：老格式条目正文'), '更新后详情行应保留')
+
+const beforeIdempotent = boardText
+const again = await callBoard('POST', { keyword: '#h11111111', priority: 'P1', due: '2026-12-15' })
+check(again.status === 200 && readBoard() === beforeIdempotent, '重复更新应幂等')
+
+const completed = await callBoard('POST', { keyword: '#h33333333', priority: 'P1' })
+check(completed.status === 200, `已完成条目更新应 200，实际 ${completed.status}`)
+boardText = readBoard()
+check(/- \[x\] 2026-11-01 ｜ 已完成条目.*@P1（完成 2026-11-02）/.test(boardText), '改优先级不应改写完成日期')
+
+const doing = await callBoard('POST', { keyword: '待设优先级', status: 'doing' })
+check(doing.status === 200, `移到进行中应 200，实际 ${doing.status}`)
+boardText = readBoard()
+const doingSection = boardText.split('## 进行中')[1].split('## 已完成')[0]
+check(doingSection.includes('待设优先级') && doingSection.includes('  - 详情：待设优先级正文'), '进行中应保留条目与详情')
+
+const dropped = await callBoard('POST', { keyword: '#h11111111', status: 'drop' })
+check(dropped.status === 200, `移到已放弃应 200，实际 ${dropped.status}`)
+boardText = readBoard()
+check(/⛔ .*老格式条目.*（放弃 \d{4}-\d{2}-\d{2}）/.test(boardText), '已放弃条目应带放弃日期')
+
+const restored = await callBoard('POST', { keyword: '#h11111111', status: 'todo' })
+check(restored.status === 200, `移回待办应 200，实际 ${restored.status}`)
+boardText = readBoard()
+check(!/⛔ .*老格式条目/.test(boardText) && /- \[ \] .*老格式条目/.test(boardText), '移回待办应恢复复选框')
+
+const ambiguous = await callBoard('POST', { keyword: '条目', priority: 'P1' })
+check(ambiguous.status === 400 && /匹配到 \d+ 条/.test(ambiguous.json.error), '多条匹配应 400')
+
+const badJson = await callBoard('POST', '{bad json')
+check(badJson.status === 400, '非法 JSON 应 400')
+
+const boardTool = tools.find(item => item.name === 'daily_report_board')
+const toolUpdate = await boardTool.execute({ action: 'update', keyword: '#h22222222', priority: 'P3' }, {})
+check(toolUpdate.action === 'update' && /@P3/.test(readBoard()), '工具 update 应改优先级')
+console.log('看板写回校验 = 通过')
 
 async function call(method, body) {
   const req = {

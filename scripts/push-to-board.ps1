@@ -10,7 +10,11 @@
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -DryRun          # 只解析不写入
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Done "git init" # 移到「已完成」
 #   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Drop "git init" # 移到「已放弃」
+#   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Update "git init" -Priority P1 -Due 2026-11-30 -Status doing
+#   pwsh -NoProfile -File push-to-board.ps1 -BoardPath ... -Update "#h1234abcd" -Priority none -Due none
 #
+# 条目格式：- [ ] 日期 ｜ 标题 ｜ 来源：… ｜ #h指纹 ｜ @P1 ｜ !2026-11-30
+# 后两段可省略，老看板（无优先级/截止）照常读写。日报条目末尾写 @P1 / !2026-11-30 会被带进看板。
 # 去重：同一标题（条目取前 36 字）已在看板任意一栏出现时跳过。
 # 小节名由 -Section 指定：日报默认「明日开场清单」，周报/月报传「下周开场」「下月开场」。
 
@@ -20,6 +24,10 @@ param(
   [string]$Section = '明日开场清单',
   [string]$Done,
   [string]$Drop,
+  [string]$Update,
+  [string]$Priority,
+  [string]$Due,
+  [string]$Status,
   [switch]$DryRun,
   [switch]$Show
 )
@@ -74,6 +82,44 @@ function Section-End([string[]]$lines, [int]$start) {
   return $lines.Count
 }
 
+function Get-EntryMeta([string]$text) {
+  $priority = ''
+  $due = ''
+  $p = [regex]::Match($text, '(?i)(?:^|\s)@(p[1-3])(?=\s|$)')
+  if ($p.Success) { $priority = $p.Groups[1].Value.ToUpper() }
+  $d = [regex]::Match($text, '(?:^|\s)!(\d{4}-\d{2}-\d{2})(?=\s|$)')
+  if ($d.Success) { $due = $d.Groups[1].Value }
+  return @{ Priority = $priority; Due = $due }
+}
+
+function Remove-EntryMeta([string]$text) {
+  $clean = $text -replace '(?i)(?:^|\s)@p[1-3](?=\s|$)', ' '
+  $clean = $clean -replace '(?:^|\s)!\d{4}-\d{2}-\d{2}(?=\s|$)', ' '
+  return ($clean -replace '\s+', ' ').Trim()
+}
+
+# 重写条目的元数据段，保留原有顺序与详情行；没有优先级/截止时就是老格式。
+function Set-EntryMeta([string]$line, [string]$priority, [string]$due) {
+  $body = ($line -replace '^\s*-\s*(?:\[[ xX]\]|⛔)\s*', '').Trim()
+  $body = $body -replace '（(?:完成|放弃) \d{4}-\d{2}-\d{2}）(?=\s*(?:｜|$))', ''
+  $parts = @()
+  foreach ($part in ($body -split '｜')) {
+    $value = $part.Trim()
+    if ($value -eq '') { continue }
+    if ($value -match '^@[Pp][1-3]$' -or $value -match '^!\d{4}-\d{2}-\d{2}$') { continue }
+    $parts += (Remove-EntryMeta $value)
+  }
+  if ($priority) { $parts += ('@' + $priority.ToUpper()) }
+  if ($due) { $parts += ('!' + $due) }
+  return ('- [ ] ' + ($parts -join ' ｜ '))
+}
+
+function Get-EntryEnd([string[]]$lines, [int]$start) {
+  $end = $start
+  while ($end + 1 -lt $lines.Count -and $lines[$end + 1] -match '^\s{2,}\S') { $end++ }
+  return $end
+}
+
 function Save-Board([string[]]$lines) {
   $outList = New-Object System.Collections.Generic.List[string]
   foreach ($l in $lines) {
@@ -88,6 +134,120 @@ function Save-Board([string[]]$lines) {
 $board = Read-Board
 
 if ($Show) { $board | ForEach-Object { Write-Output $_ }; return }
+
+# ---------- -Update：改优先级 / 截止日 / 状态，一条一条来 ----------
+if ($Update) {
+  if ($Done -or $Drop) { throw '-Update 不能和 -Done / -Drop 同用。' }
+  if (-not $Priority -and -not $Due -and -not $Status) {
+    throw '-Update 至少要给一个 -Priority / -Due / -Status。'
+  }
+  if ($Priority -and $Priority -notmatch '^(P[1-3]|none)$') { throw "-Priority 只能是 P1/P2/P3/none，收到：$Priority" }
+  if ($Due -and $Due -ne 'none') {
+    if ($Due -notmatch '^\d{4}-\d{2}-\d{2}$') { throw "-Due 要写 YYYY-MM-DD 或 none，收到：$Due" }
+    try { [void][datetime]::ParseExact($Due, 'yyyy-MM-dd', $null) }
+    catch { throw "-Due 不是有效日期：$Due" }
+  }
+  $statusValue = if ($Status) { $Status.ToLower() } else { '' }
+  if ($statusValue -and $statusValue -notin @('todo', 'doing', 'done', 'drop')) {
+    throw "-Status 只能是 todo/doing/done/drop，收到：$Status"
+  }
+
+  $hits = @()
+  $needle = $Update.Trim()
+  for ($i = 0; $i -lt $board.Count; $i++) {
+    if ($board[$i] -notmatch '^\s*-\s*(?:\[[ xX]\]|⛔)') { continue }
+    if ($board[$i].IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $hits += $i }
+  }
+  if ($hits.Count -eq 0) { throw "看板里没有匹配「$needle」的条目。" }
+  if ($hits.Count -gt 1) {
+    throw "「$needle」匹配到 $($hits.Count) 条，请写得更具体（也可以直接用条目里的 #h 指纹）。"
+  }
+
+  $start = $hits[0]
+  $end = Get-EntryEnd $board $start
+  $detail = @()
+  if ($end -gt $start) { $detail = @($board[($start + 1)..$end]) }
+
+  $sectionName = ''
+  for ($i = $start; $i -ge 0; $i--) {
+    if ($board[$i] -match '^##\s+(.+?)\s*$') { $sectionName = $Matches[1]; break }
+  }
+  $currentStatus = switch ($sectionName) {
+    '待办' { 'todo' }
+    '进行中' { 'doing' }
+    '已完成' { 'done' }
+    '已放弃' { 'drop' }
+    default { 'todo' }
+  }
+  $targetStatus = if ($statusValue) { $statusValue } else { $currentStatus }
+
+  $old = Get-EntryMeta $board[$start]
+  $newPriority = if ($Priority) { if ($Priority -eq 'none') { '' } else { $Priority.ToUpper() } } else { $old.Priority }
+  $newDue = if ($Due) { if ($Due -eq 'none') { '' } else { $Due } } else { $old.Due }
+  $body = (Set-EntryMeta $board[$start] $newPriority $newDue) -replace '^- \[ \]\s*', ''
+  $existingStamp = ''
+  if ($board[$start] -match '（(?:完成|放弃) \d{4}-\d{2}-\d{2}）') { $existingStamp = $Matches[0] }
+  $body = $body -replace '（(?:完成|放弃) \d{4}-\d{2}-\d{2}）(?=\s*(?:｜|$))', ''
+  # 只改优先级/截止日时保留原来的完成/放弃日期，别把历史改写成今天。
+  $stamp = if ($targetStatus -eq $currentStatus -and $existingStamp) { $existingStamp } else { "（完成 $Today）" }
+  $newLine = switch ($targetStatus) {
+    'done' { '- [x] ' + $body + $stamp }
+    'drop' { '- ⛔ ' + $body + $(if ($existingStamp -and $targetStatus -eq $currentStatus) { $existingStamp } else { "（放弃 $Today）" }) }
+    default { '- [ ] ' + $body }
+  }
+
+  if ($targetStatus -eq $currentStatus) {
+    if ($DryRun) {
+      Write-Output 'DryRun：将改为：'
+      Write-Output $newLine
+      return
+    }
+    $board[$start] = $newLine
+    Save-Board $board
+    Write-Output ("已更新 1 条 → {0}" -f $BoardPath)
+    Write-Output $newLine
+    return
+  }
+
+  $targetSection = switch ($targetStatus) {
+    'doing' { '进行中' }
+    'done' { '已完成' }
+    'drop' { '已放弃' }
+    default { '待办' }
+  }
+  if ($DryRun) {
+    Write-Output ("DryRun：将移到「{0}」：" -f $targetSection)
+    Write-Output $newLine
+    return
+  }
+
+  $kept = New-Object System.Collections.Generic.List[string]
+  for ($i = 0; $i -lt $board.Count; $i++) {
+    if ($i -ge $start -and $i -le $end) { continue }
+    $kept.Add($board[$i])
+  }
+  $targetIdx = Find-Section $kept.ToArray() $targetSection
+  if ($targetIdx -lt 0) {
+    if ($kept.Count -gt 0 -and $kept[$kept.Count - 1].Trim() -ne '') { $kept.Add('') }
+    $kept.Add('## ' + $targetSection)
+    $targetIdx = $kept.Count - 1
+  }
+  $targetEnd = Section-End $kept.ToArray() $targetIdx
+  $insertAt = $targetEnd
+  while ($insertAt -gt $targetIdx + 1 -and $kept[$insertAt - 1].Trim() -eq '') { $insertAt-- }
+
+  $out = New-Object System.Collections.Generic.List[string]
+  for ($i = 0; $i -lt $insertAt; $i++) { $out.Add($kept[$i]) }
+  if ($out.Count -gt 0 -and $out[$out.Count - 1] -match '^##\s') { $out.Add('') }
+  $out.Add($newLine)
+  foreach ($line in $detail) { $out.Add($line) }
+  for ($i = $insertAt; $i -lt $kept.Count; $i++) { $out.Add($kept[$i]) }
+
+  Save-Board $out.ToArray()
+  Write-Output ("已移到「{0}」→ {1}" -f $targetSection, $BoardPath)
+  Write-Output $newLine
+  return
+}
 
 # ---------- -Done / -Drop：把匹配的待办移到「已完成」/「已放弃」 ----------
 $mode = if ($Drop) { 'drop' } elseif ($Done) { 'done' } else { $null }
@@ -163,13 +323,17 @@ for ($i = $start; $i -lt $lines.Count; $i++) {
   if ($lines[$i] -match '^\s*(?:\d+[\.、]|[-*])\s+(.+)$') {
     $t = $Matches[1].Trim()
     # 以 ✅ 开头或标注「已完成」的条目视为已办，不进看板
-    if ($t -notmatch '^(✅|\[x\])' -and $t -notmatch '已完成') { $items += $t }
+    if ($t -notmatch '^(✅|\[x\])' -and $t -notmatch '已完成') {
+      $meta = Get-EntryMeta $t
+      $clean = Remove-EntryMeta $t
+      if ($clean -ne '') { $items += [pscustomobject]@{ Text = $clean; Priority = $meta.Priority; Due = $meta.Due } }
+    }
   }
 }
 if ($items.Count -eq 0) { throw "「$Section」里没有解析到条目：$Report" }
 
 Write-Output ("解析到 {0} 条待办：来自 {1}" -f $items.Count, $Report)
-foreach ($it in $items) { Write-Output ('  - ' + $it) }
+foreach ($it in $items) { Write-Output ('  - ' + $it.Text) }
 
 # ---------- 去重：同时比对「详情指纹」与「标题指纹」 ----------
 function Get-TitleOfLine([string]$line) {
@@ -198,12 +362,15 @@ for ($i = 0; $i -lt $board.Count; $i++) {
 $newLines = @(); $added = 0; $skipped = @()
 $src = Split-Path $Report -Leaf
 foreach ($it in $items) {
-  $title = Get-Title $it
-  $hash = Get-Hash $it
+  $title = Get-Title $it.Text
+  $hash = Get-Hash $it.Text
   $tkey = Get-Hash $title
   if ($existing.ContainsKey($hash) -or $existing.ContainsKey($tkey)) { $skipped += $title; continue }
-  $newLines += ('- [ ] {0} ｜ {1} ｜ 来源：{2} ｜ #h{3}' -f $Today, $title, $src, $hash)
-  $newLines += ('  - 详情：{0}' -f $it)
+  $metaText = ''
+  if ($it.Priority) { $metaText += ' ｜ @' + $it.Priority }
+  if ($it.Due) { $metaText += ' ｜ !' + $it.Due }
+  $newLines += ('- [ ] {0} ｜ {1} ｜ 来源：{2} ｜ #h{3}{4}' -f $Today, $title, $src, $hash, $metaText)
+  $newLines += ('  - 详情：{0}' -f $it.Text)
   $existing[$hash] = $true
   $existing[$tkey] = $true
   $added++
