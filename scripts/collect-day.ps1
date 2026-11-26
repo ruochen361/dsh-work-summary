@@ -49,6 +49,92 @@ function Test-SkipPath([string]$rel) {
 $sb = [System.Collections.Generic.List[string]]::new()
 function Add-Line([string]$s = '') { $sb.Add($s) }
 
+# ---------- 源数据归档 ----------
+# `_源数据` 只保留最近 60 个 Markdown；更旧的按数据日期分季度压进 `_归档\YYYY-QN.zip`。
+# 只归档不是今天的文件；打包成功并校验条目后才删除原文件，失败只记一行，不影响采集。
+$archiveKeep = 60
+$archiveDir = Join-Path $ReportDir '_归档'
+
+function Get-SourceDay([string]$filePath) {
+  $name = [IO.Path]::GetFileNameWithoutExtension($filePath)
+  if ($name -match '^(\d{4})-(\d{2})-(\d{2})$') { return $name }
+  if ($name -match '^周期-(\d{4})-(\d{2})-(\d{2})_') {
+    return '{0}-{1}-{2}' -f $Matches[1], $Matches[2], $Matches[3]
+  }
+  return (Get-Item -LiteralPath $filePath).LastWriteTime.ToString('yyyy-MM-dd')
+}
+
+function Get-QuarterName([string]$day) {
+  $year = [int]$day.Substring(0, 4)
+  $month = [int]$day.Substring(5, 2)
+  return '{0}-Q{1}' -f $year, ([math]::Floor(($month - 1) / 3) + 1)
+}
+
+function Add-ArchiveIndex([string]$quarter, [int]$added, [string]$first, [string]$last, [string]$zipName) {
+  $index = Join-Path $archiveDir '索引.md'
+  if (-not (Test-Path -LiteralPath $index)) {
+    Set-Content -LiteralPath $index -Encoding UTF8 -Value @(
+      '# 源数据归档索引'
+      ''
+      '| 归档时间 | 季度 | 新增 | 区间 | 包 |'
+      '|---|---|---:|---|---|'
+    )
+  }
+  $row = '| {0} | {1} | +{2} | {3} ~ {4} | `{5}` |' -f (Get-Date -Format 'yyyy-MM-dd HH:mm'), $quarter, $added, $first, $last, $zipName
+  Add-Content -LiteralPath $index -Encoding UTF8 -Value $row
+}
+
+function Invoke-SourceArchive {
+  $notes = [System.Collections.Generic.List[string]]::new()
+  try {
+    if (-not (Test-Path -LiteralPath $outDir)) { return @() }
+    $all = @(Get-ChildItem -LiteralPath $outDir -File -Filter '*.md' -Force -ErrorAction Stop)
+    $todayName = [IO.Path]::GetFileName($outFile)
+    $old = @($all | Where-Object { $_.Name -ne $todayName })
+    # 今天这次采集即将写入的文件也算一个名额，所以总数是旧文件 + 1。
+    $total = $old.Count + 1
+    if ($total -le $archiveKeep) { return @() }
+
+    $excess = $total - $archiveKeep
+    $candidates = @($old | ForEach-Object {
+        [pscustomobject]@{ File = $_; Day = (Get-SourceDay $_.FullName) }
+      } | Sort-Object Day, @{ Expression = { $_.File.Name } })
+    $take = @($candidates | Select-Object -First $excess)
+
+    foreach ($group in ($take | Group-Object { Get-QuarterName $_.Day })) {
+      $zipName = '{0}.zip' -f $group.Name
+      $zipPath = Join-Path $archiveDir $zipName
+      $paths = @($group.Group | ForEach-Object { $_.File.FullName })
+      $days = @($group.Group | ForEach-Object { $_.Day } | Sort-Object)
+      $added = $paths.Count
+      try {
+        New-Item -ItemType Directory -Force -Path $archiveDir | Out-Null
+        if (Test-Path -LiteralPath $zipPath) {
+          Compress-Archive -LiteralPath $paths -DestinationPath $zipPath -Update -CompressionLevel Optimal -ErrorAction Stop
+        } else {
+          Compress-Archive -LiteralPath $paths -DestinationPath $zipPath -CompressionLevel Optimal -ErrorAction Stop
+        }
+
+        # 先确认压缩包里确实有这些条目，再删源文件；避免删了却没进包。
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        try { $entryNames = @($zip.Entries | ForEach-Object { $_.FullName }) }
+        finally { $zip.Dispose() }
+        $missing = @($paths | Where-Object { $entryNames -notcontains [IO.Path]::GetFileName($_) })
+        if ($missing.Count -gt 0) { throw "压缩包缺少 $($missing.Count) 个文件" }
+
+        foreach ($path in $paths) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+        Add-ArchiveIndex $group.Name $added $days[0] $days[$days.Count - 1] $zipName
+        $notes.Add("> 归档：$added 个源数据 → ``_归档\$zipName``（$($days[0]) ~ $($days[$days.Count - 1])）")
+      } catch {
+        $notes.Add("> 归档失败：$($_.Exception.Message)")
+      }
+    }
+  } catch {
+    $notes.Add("> 归档失败：$($_.Exception.Message)")
+  }
+  return $notes.ToArray()
+}
+
 Add-Line "# 工作痕迹源数据 · $Date"
 Add-Line ''
 Add-Line "> 采集窗口：$sinceArg ~ $untilArg（本地时区 $([DateTime]::Now.ToString('zzz'))）"
@@ -265,6 +351,15 @@ foreach ($d in @('_报告源文件', '_巡检', '_日报', '_协作规范')) {
   }
 }
 Add-Line ''
+
+# ---------- 6. 源数据归档 ----------
+$archiveNotes = @(Invoke-SourceArchive)
+if ($archiveNotes.Count -gt 0) {
+  Add-Line '## 6. 源数据归档'
+  Add-Line ''
+  foreach ($note in $archiveNotes) { Add-Line $note }
+  Add-Line ''
+}
 
 Set-Content -Path $outFile -Value $sb -Encoding UTF8
 Write-Output $outFile

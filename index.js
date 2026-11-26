@@ -68,6 +68,8 @@ const DEFAULTS = {
   monthScheduleTime: '01:00',
   /** 月报计划任务标题。 */
   monthScheduleTitle: '每月工作月报',
+  /** 日报保存时的软校验；只提醒，不阻断落盘。 */
+  quality: { minEvidence: 3 },
   /** 运行日志目录；留空表示 `<reportDir>\_日志`。设置页改的是这个键。 */
   logDir: '',
 }
@@ -80,6 +82,27 @@ const SECTIONS = [
   ['四', '问题与风险'],
   ['五', '后续建议'],
   ['六', '明日开场清单'],
+]
+
+/** 空话词库：只用于日报软校验提醒，不决定落盘与否。 */
+const FILLER_WORDS = [
+  '继续推进', '加强沟通', '持续优化', '进一步提升', '稳步推进', '深入推进',
+  '扎实做好', '高度重视', '协同发力', '形成闭环', '提质增效', '落地见效',
+]
+
+/** 建议小节里算「可执行」的命令线索。 */
+const COMMAND_HINT = /(?:^|[\s`（(])(?:npm|pnpm|yarn|git|node|pwsh|powershell|python|pip|dotnet|cargo|docker|kubectl|rg|curl|make)\b|(?:^|[\s`（(])(?:Get|Set|New|Remove|Test|Start|Stop|Invoke|Import|Export|Select|Where|ForEach)-[A-Za-z]+/m
+
+/**
+ * 路径/提交号线索。分开写是为了让 Windows 盘符、UNC、POSIX/相对路径、
+ * 带扩展名的文件名和 7–40 位十六进制提交号都能被认出来。
+ */
+const EVIDENCE_PATTERNS = [
+  /[A-Za-z]:[\\/][^\s`"'<>|，。；：、）)]+/g,
+  /\\\\[^\s`"'<>|，。；：、）)]+/g,
+  /(?<![\w])(?:\.{1,2}[\\/]|[A-Za-z_][\w.-]*[\\/])[^\s`"'<>|，。；：、）)]+/g,
+  /\b[\w.-]+\.(?:md|ps1|js|mjs|cjs|json|ya?ml|toml|txt|log|ts|tsx|jsx|py|cs|go|rs|sh|bat|cmd|exe|svg|png)\b/gi,
+  /\b[0-9a-f]{7,40}\b/gi,
 ]
 
 /**
@@ -461,6 +484,74 @@ function sectionLines(text, number) {
     out.push(trimmed)
   }
   return out
+}
+
+/**
+ * 正文里的路径/提交号引用，按去重后的条目数计。
+ * @param {string} text - 日报正文。
+ * @returns {Set<string>} 归一化后的引用。
+ */
+function evidenceRefs(text) {
+  const found = new Set()
+  // 链接里的域名和路径不算「工作证据」，先去掉；行内代码保留内容，方便识别 `index.js`。
+  const clean = String(text).replace(/https?:\/\/\S+/g, ' ').replace(/`([^`]*)`/g, ' $1 ')
+  for (const pattern of EVIDENCE_PATTERNS) {
+    for (const match of clean.matchAll(pattern)) {
+      const value = match[0]
+        .replace(/^[`'"([（]+/, '')
+        .replace(/[`'")\]）.,;:，。；：、]+$/, '')
+        .toLowerCase()
+      if (value.length >= 2) found.add(value)
+    }
+  }
+  // 同一个 Windows 路径会同时命中「完整路径 / 相对后缀 / 文件名」，只留最长的那条，避免虚高。
+  const refs = new Set()
+  for (const value of [...found].sort((a, b) => b.length - a.length)) {
+    if ([...refs].some(existing => existing.includes(value))) continue
+    refs.add(value)
+  }
+  return refs
+}
+
+/** 建议小节里是否已有路径或可执行命令。 */
+function hasPathOrCommand(text) {
+  if (evidenceRefs(text).size > 0) return true
+  if (COMMAND_HINT.test(text)) return true
+  // 反引号里带空格的多半是命令或脚本调用，例如 `collect-day.ps1 -Date 2026-11-25`。
+  return (String(text).match(/`[^`\n]+`/g) ?? []).some(span => /\s/.test(span.trim()))
+}
+
+/** 读取 `quality.minEvidence`：支持嵌套对象，也兼容扁平点号键；非法值退回默认 3。 */
+function minEvidenceOf(config) {
+  const quality = config?.quality
+  const nested = quality && typeof quality === 'object' ? quality.minEvidence : quality
+  const flat = config?.['quality.minEvidence']
+  const raw = flat ?? nested ?? DEFAULTS.quality.minEvidence
+  const value = Number(raw)
+  return Number.isInteger(value) && value > 0 ? value : DEFAULTS.quality.minEvidence
+}
+
+/**
+ * 日报软校验：只生成提醒，不抛错，也不阻止落盘。
+ * @param {string} content - 日报正文（未补 footer）。
+ * @param {number} minEvidence - 证据引用下限。
+ * @returns {string[]} 提醒文案。
+ */
+function qualityWarnings(content, minEvidence) {
+  const warnings = []
+  const refs = evidenceRefs(content)
+  if (refs.size < minEvidence) {
+    warnings.push(`证据偏少：正文只有 ${refs.size} 处路径/提交号引用（建议至少 ${minEvidence} 处）`)
+  }
+  const filler = FILLER_WORDS.filter(word => String(content).includes(word))
+  if (filler.length > 0) {
+    warnings.push(`空话词：${filler.join('、')}；换成具体动作、对象或结果`)
+  }
+  const advice = sectionLines(content, '五').join('\n')
+  if (advice.trim() !== '' && !hasPathOrCommand(advice)) {
+    warnings.push('「五、后续建议」没有路径或命令，建议补上具体文件、脚本或命令')
+  }
+  return warnings
 }
 
 /**
@@ -957,7 +1048,7 @@ export function apply(ctx, rawConfig) {
     description:
       '采集某一天的工作痕迹，生成日报的源数据文件并返回它的路径、小节清单和日报模板。'
       + '写日报前先调用它：结果里的 sourcePath 要读一遍，template 是必须填满的六节骨架。'
-      + '采集是只读的，只写 _源数据 目录。',
+      + '采集写 _源数据；超过 60 个时自动把旧文件按季度归档到 _归档。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1014,6 +1105,10 @@ export function apply(ctx, rawConfig) {
         throw new Error(`采集脚本未产出 ${date} 的源数据：${tail(result.stdout) || String(error)}`)
       }
       const lines = text.split(/\r?\n/)
+      // 归档结果只出现在源数据里；这里顺手抄一行到运行日志，失败也不影响采集。
+      for (const note of lines.filter(line => /^>\s*归档/.test(line))) {
+        await logLine(config, note.includes('失败') ? 'warn' : 'info', note.replace(/^>\s*/, ''))
+      }
       const headings = lines.filter(line => /^##\s/.test(line)).map(line => line.trim())
       const board = await readBoard(config.reportDir)
       return {
@@ -1033,7 +1128,8 @@ export function apply(ctx, rawConfig) {
     description:
       '校验并落盘当天日报，然后把它「六、明日开场清单」推进看板。'
       + '正文必须包含六个固定小节（一、今日概览 … 六、明日开场清单）；缺节或留占位符会直接报错且不写文件，'
-      + '按报错修好后重调即可。已存在同名日报会被整篇覆盖。',
+      + '按报错修好后重调即可。已存在同名日报会被整篇覆盖。'
+      + '落盘后会做证据密度、空话词、建议可执行性的软校验，提醒放在 warnings 与 text 里，不阻断写入。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1055,6 +1151,11 @@ export function apply(ctx, rawConfig) {
           pushed: { type: 'integer' },
           skipped: { type: 'integer' },
           boardOpen: { type: 'integer' },
+          warnings: {
+            type: 'array',
+            items: { type: 'string' },
+            description: '软校验提醒（证据密度 / 空话词 / 建议可执行性）；为空表示没发现问题。',
+          },
           text: { type: 'string' },
         },
       },
@@ -1073,6 +1174,8 @@ export function apply(ctx, rawConfig) {
       if (problems.length > 0) {
         throw new Error(`日报未写入，先修正：\n- ${problems.join('\n- ')}`)
       }
+      // 质量检查放在硬校验之后、写盘之前：只收集提醒，不改变落盘结果。
+      const warnings = qualityWarnings(content, minEvidenceOf(config))
 
       const stamp = stampInZone(config.scheduleTimeZone)
       const withFooter = /数据来源：/.test(content)
@@ -1102,7 +1205,18 @@ export function apply(ctx, rawConfig) {
       const summary = shouldPush
         ? `日报已写入 ${reportPath}；看板 ${pushed ? `新增 ${pushed} 条` : '无新增条目'}${skipped ? `，跳过重复 ${skipped} 条` : ''}，当前未完成 ${board.open.length} 条。`
         : `日报已写入 ${reportPath}；按要求未推送看板。`
-      return { date, reportPath, pushed, skipped, boardOpen: board.open.length, text: `${summary}\n${pushText}`.trim() }
+      const warningText = warnings.length > 0
+        ? `质量提醒（不影响落盘）：\n- ${warnings.join('\n- ')}`
+        : ''
+      return {
+        date,
+        reportPath,
+        pushed,
+        skipped,
+        boardOpen: board.open.length,
+        warnings,
+        text: [summary, pushText, warningText].filter(Boolean).join('\n'),
+      }
     },
   })
 

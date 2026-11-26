@@ -11,8 +11,10 @@ DeepSeek Harness 插件：定时生成日报、周报、月报。采集、结构
 ## 能做什么
 
 - 每天 23:00 采工作区改动、Git 提交、DSH 会话、看板与产物目录，生成六节日报。
+- 源数据只保留最近 60 个，更旧的按季度自动归档到 `_归档`，失败不影响当天采集。
 - 每周一 01:00 生成上一周周报，每月 1 号 01:00 生成上一个自然月月报。
 - 缺节、空骨架、占位符直接报错且不写文件；同一区间连跑两次，看板不重复。
+- 保存日报时顺带做质量软提醒：路径/提交号太少、空话词、建议不可执行只提示，不阻断落盘。
 - 侧边栏内置「日报」页面：读日报、看周报/月报、看待办、看最近 13 周贡献热力图、改定时与目录。
 
 ## 安装
@@ -27,8 +29,8 @@ plugin_manager install_bundle dsh-work-summary
 
 | 工具 | 作用 |
 |---|---|
-| `daily_report_collect` | 采集当天痕迹，返回源数据路径与六节模板 |
-| `daily_report_save` | 校验六节 → 写日报 → 推看板 |
+| `daily_report_collect` | 采集当天痕迹，返回源数据路径与六节模板；超 60 个自动归档 |
+| `daily_report_save` | 校验六节 → 写日报 → 推看板；返回质量 `warnings`（只提醒） |
 | `work_summary_period` | 聚合区间，写周报/月报并推看板；`offset: 1` 取上一周期 |
 | `daily_report_board` | `show` 未完成，`done` / `drop` 回写看板 |
 
@@ -45,6 +47,7 @@ plugin_manager install_bundle dsh-work-summary
 | `monthScheduleTime` | `01:00` | 月报时间（每月 1 号，生成上月） |
 | `weekScheduleEnabled` / `monthScheduleEnabled` | `true` | 周报 / 月报任务开关 |
 | `pushOnSave` | `true` | 日报保存后是否自动推看板 |
+| `quality.minEvidence` | `3` | 日报软校验要求的最少路径/提交号引用数 |
 | `pwsh` / `timeoutMs` | `pwsh` / `240000` | PowerShell 与单次超时 |
 
 ## 数据布局
@@ -55,7 +58,8 @@ plugin_manager install_bundle dsh-work-summary
 ├── 周报-YYYY-MM-DD_YYYY-MM-DD.md
 ├── 月报-YYYY-MM.md
 ├── 看板.md
-├── _源数据/          # 采集底稿，只读生成
+├── _源数据/          # 采集底稿，只保留最近 60 个
+├── _归档/            # 更旧源数据按季度打包，含索引.md
 ├── _日志/
 └── settings.json
 ```
@@ -64,7 +68,7 @@ plugin_manager install_bundle dsh-work-summary
 
 ```bash
 npm run check   # node --check index.js / client.js
-npm test        # 假 ctx 驱动工具、路由、计划任务与周期聚合
+npm test        # 假 ctx 驱动工具、路由、计划任务、周期聚合、质量软校验与归档
 ```
 
 测试会启动 `pwsh`，在受限沙箱里需完整权限。仓库：`index.js`（Host）、`client.js`（侧边栏）、`scripts/*.ps1`（采集/看板）、`PROMPT.md`（正文规则）。

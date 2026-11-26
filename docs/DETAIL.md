@@ -2,18 +2,37 @@
 
 把「定时写工作日报」扩展成日报、周报、月报三条流水线：采集、校验、写盘、推看板由工具确定性地完成，模型只负责写正文。
 
-运行期数据都放在 `~/.dsh/dsh-work-summary`（Windows：`%USERPROFILE%\.dsh\dsh-work-summary`）：日报、周报/月报、看板、`_源数据`、`_日志`、`settings.json`。首次激活时自动创建，目录可在设置页改；代码与提示词随插件仓库走。
+运行期数据都放在 `~/.dsh/dsh-work-summary`（Windows：`%USERPROFILE%\.dsh\dsh-work-summary`）：日报、周报/月报、看板、`_源数据`、`_归档`、`_日志`、`settings.json`。首次激活时自动创建，目录可在设置页改；代码与提示词随插件仓库走。
 
 ## 它提供什么
 
 | 工具 | 作用 |
 |---|---|
-| `daily_report_collect` | 运行 `collect-day.ps1` 采集当天痕迹，返回源数据路径、小节清单、看板未完成条数，以及六节日报模板 |
-| `daily_report_save` | 校验六个固定小节（一、今日概览 … 六、明日开场清单），写 `日报-YYYY-MM-DD.md`，再把「明日开场清单」推进看板 |
+| `daily_report_collect` | 运行 `collect-day.ps1` 采集当天痕迹，返回源数据路径、小节清单、看板未完成条数，以及六节日报模板；超过 60 个源数据时自动按季度归档 |
+| `daily_report_save` | 校验六个固定小节（一、今日概览 … 六、明日开场清单），写 `日报-YYYY-MM-DD.md`，再把「明日开场清单」推进看板；返回质量软校验 `warnings` |
 | `work_summary_period` | 跑 `collect-range.ps1` 采集区间底稿，按区间日报 + 看板拼四节周报/月报，同款校验后落盘并推看板；`offset: 1` 取上一周期 |
 | `daily_report_board` | `show` 列未完成待办；`done` 移到「已完成」；`drop` 移到「已放弃」 |
 
-`daily_report_save` 缺小节、只写了骨架、或留有 `TODO / 待填 / {{…}}` 时会直接报错且**不写文件**，按报错补齐后重调即可；同一日期重复提交会整篇覆盖。采集是只读的，只写 `_源数据` 目录。
+`daily_report_save` 缺小节、只写了骨架、或留有 `TODO / 待填 / {{…}}` 时会直接报错且**不写文件**，按报错补齐后重调即可；同一日期重复提交会整篇覆盖。采集写 `_源数据`，超过 60 个时自动把旧文件归档到 `_归档`。
+
+## 质量自检（软校验）
+
+质量检查在结构硬校验之后、写盘之前执行，**只返回提醒，不改变落盘结果**。`daily_report_save` 的结果多一个 `warnings` 数组，`text` 里也会列出同样内容：
+
+- **证据密度**：统计正文中的路径（Windows 盘符、UNC、POSIX/相对路径、带扩展名文件名）与 7–40 位十六进制提交号，去重后少于 `quality.minEvidence`（默认 3）就提醒。
+- **空话词**：命中「继续推进 / 加强沟通 / 持续优化 / 进一步提升 / 稳步推进 / 深入推进 / 扎实做好 / 高度重视 / 协同发力 / 形成闭环 / 提质增效 / 落地见效」时列出命中词，提醒换成具体动作、对象或结果。
+- **建议可执行性**：`## 五、后续建议` 里既没有路径，也没有命令（`npm test`、`pwsh …`、`Get-…` 等）时提醒补具体文件或命令。
+
+`quality.minEvidence` 可以写成嵌套对象，也兼容扁平的 `quality.minEvidence` 键；非正整数退回默认 3。`warnings` 为空表示没发现问题，日报照常写入并推看板。
+
+## 源数据归档
+
+每次 `collect-day.ps1` 结束时会数一遍 `_源数据/*.md`。超过 60 个时，按文件名里的数据日期排序，把最旧的超出部分按季度打进 `_归档/YYYY-QN.zip`：
+
+- 只处理不是当天的文件；当天文件永远留在 `_源数据`。
+- 打包后先读 zip 条目，确认这些文件都在，再删除原文件；失败只写一行「归档失败」，采集照常以退出码 0 结束。
+- 同一季度包已存在时用 `-Update` 追加，并在 `_归档/索引.md` 追加一行（归档时间、季度、新增数、区间、包名）。
+- 归档结果同时写进当天源数据的「6. 源数据归档」和运行日志；没触发归档时两处都不写。
 
 ## 周报 / 月报聚合
 
@@ -68,13 +87,14 @@
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `reportDir` | `~/.dsh/dsh-work-summary` | 数据目录：日报、看板、源数据（不含代码）；设置页可改 |
+| `reportDir` | `~/.dsh/dsh-work-summary` | 数据目录：日报、看板、源数据、归档（不含代码）；设置页可改 |
 | `workspace` | `~/.dsh/dsh-work-summary` | 采集脚本扫描的工作区根；想看自己的工作区就改成那 |
 | `scriptDir` | `<插件目录>\scripts` | 三个 PowerShell 脚本（单日 / 区间 / 推看板）的位置，随仓库走 |
 | `promptPath` | `<插件目录>\PROMPT.md` | 日报正文规则，随仓库走 |
 | `pwsh` | `pwsh` | PowerShell 可执行文件 |
 | `timeoutMs` | `240000` | 单个脚本超时 |
 | `pushOnSave` | `true` | `daily_report_save` 默认是否推看板 |
+| `quality.minEvidence` | `3` | 日报软校验要求的最少路径/提交号引用数；嵌套或扁平点号键都可 |
 | `scheduleEnabled` | `true` | 是否托管计划任务 |
 | `scheduleAdopt` | `true` | 是否认领旧日报任务 |
 | `scheduleTitle` | `每日工作日报` | 日报任务标题，也是识别依据 |
@@ -129,13 +149,15 @@
 | `PROMPT.md` | 运行期正文规则，改完下一轮生成生效 |
 | `test/route.test.mjs` | 假 ctx 驱动 Host：工具、路由、计划任务、参数校验 |
 | `test/period.test.mjs` | 周期聚合：四节、命名、offset、看板去重、非法区间 |
+| `test/quality.test.mjs` | 质量软校验：空话/缺证据仍落盘、正常日报零提醒、两种阈值配置 |
+| `test/archive.test.mjs` | 源数据归档：保留 60 个、季度包字节一致、重复采集不追加、失败不阻断 |
 
 ```powershell
 npm run check   # node --check index.js / client.js
-npm test        # 两份测试串行跑
+npm test        # 四份测试串行跑
 ```
 
-测试会启动 `pwsh`；受限沙箱可能因命名管道拒绝访问，需要完整权限。测试只写 `test/.tmp-period` 与 `_probe` 临时根，不碰真实数据目录。
+测试会启动 `pwsh`；受限沙箱可能因命名管道拒绝访问，需要完整权限。测试只写 `test/.tmp-period`、`test/.tmp-quality`、`test/.tmp-archive` 与 `_probe` 临时根，不碰真实数据目录。
 
 ## 限制
 

@@ -7,3 +7,6 @@
         scheduleAdopt: true
         scheduleTime: '23:00'
         scheduleTimeZone: 'Asia/Shanghai'
+        # 日报软校验：正文至少引用几处路径/提交号；只提醒，不阻断落盘。
+        quality:
+          minEvidence: 3

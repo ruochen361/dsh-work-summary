@@ -34,7 +34,7 @@
     "dsh": ">=0.2.3-alpha.2"
   },
   "scripts": {
-    "test": "node test/route.test.mjs && node test/period.test.mjs",
+    "test": "node test/route.test.mjs && node test/period.test.mjs && node test/quality.test.mjs && node test/archive.test.mjs",
     "check": "node --check index.js && node --check client.js"
   },
   "dsh": {

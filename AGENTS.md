@@ -18,12 +18,14 @@
 |---|---|
 | `index.js` | Host：工具、校验、HTTP、计划任务、周期区间解析 |
 | `client.js` | 侧边栏面板与设置页 |
-| `scripts/collect-day.ps1` | 单日采集，写 `_源数据/YYYY-MM-DD.md` |
+| `scripts/collect-day.ps1` | 单日采集，写 `_源数据/YYYY-MM-DD.md`；超过 60 个按季度归档到 `_归档` |
 | `scripts/collect-range.ps1` | 区间采集，写 `_源数据/周期-from_to.md` |
 | `scripts/push-to-board.ps1` | 日报/周报/月报的末节推看板，按指纹去重 |
 | `PROMPT.md` | 日报/周期正文规则，运行期读取 |
 | `test/route.test.mjs` | 假 ctx 驱动 Host：工具、路由、计划任务、参数校验 |
 | `test/period.test.mjs` | 周期聚合：四节、命名、offset、看板去重、拒绝非法区间 |
+| `test/quality.test.mjs` | 质量软校验：空话/缺证据仍落盘、正常日报零提醒、阈值配置 |
+| `test/archive.test.mjs` | 源数据归档：保留 60 个、季度包字节一致、失败不阻断 |
 | `docs/DETAIL.md` | 机制与配置细节 |
 | `docs/ROADMAP.md` | 需求清单，一需求一 ID |
 
@@ -31,12 +33,14 @@
 
 ```powershell
 npm run check                      # node --check index.js && node --check client.js
-npm test                           # route.test.mjs + period.test.mjs
+npm test                           # route + period + quality + archive 四份测试
 node test/route.test.mjs           # 单跑
 node test/period.test.mjs          # 单跑
+node test/quality.test.mjs         # 单跑
+node test/archive.test.mjs         # 单跑
 ```
 
-测试会启动 `pwsh`。在 DSH 沙箱里，受限模式会因命名管道报 `Access to the path '\\.\pipe\LOCAL\dotnet_...' is denied`，需要以完整权限运行。测试使用 `test/.tmp-period` 与 `_probe` 作为临时根，不要指向真实的 `~/.dsh/dsh-work-summary`。
+测试会启动 `pwsh`。在 DSH 沙箱里，受限模式会因命名管道报 `Access to the path '\\.\pipe\LOCAL\dotnet_...' is denied`，需要以完整权限运行。测试使用 `test/.tmp-period`、`test/.tmp-quality`、`test/.tmp-archive` 与 `_probe` 作为临时根，不要指向真实的 `~/.dsh/dsh-work-summary`。
 
 ## 编码约定
 
@@ -45,6 +49,7 @@ node test/period.test.mjs          # 单跑
 - 日期一律用 `YYYY-MM-DD` 字符串。日期运算走 `parseDay` / `shiftDay` / `daysBetween` 的 UTC 逻辑，不要用本地时区 `new Date('YYYY-MM-DD')` 做天数计算。
 - 周区间以周一为起点；计划任务时间使用 `scheduleTimeZone`（默认 `Asia/Shanghai`），「今天」用 `dateInZone`。
 - 日报固定六节（`SECTIONS`），周报/月报固定四节；缺节、正文过短、含 `TODO`/`待填`/`{{` 必须在写文件前抛错。
+- 日报质量软校验只返回 `warnings` 并拼进 `text`，不得阻断落盘；阈值 `quality.minEvidence` 默认 3，支持嵌套与扁平点号键。
 - 看板按标题/条目指纹去重；周报/月报推最后一节，调用 `push-to-board.ps1 -Section <末节名>`。
 - 计划任务按标题识别。日报的 `findOwnTask` 会排除提示词含 `work_summary_period` 的任务；周期提示词不要写 `dsh-work-summary`，否则可能被日报认领。
 - 测试与脚本不得写入真实数据目录；临时文件放 `test/`、`_probe/`，并确认已在 `.gitignore` 中。
@@ -63,3 +68,4 @@ node test/period.test.mjs          # 单跑
 - 计划任务默认：日报 `23:00`；周报每周一 `01:00` 生成上一周；月报每月 1 号 `01:00` 生成上一个自然月。
 - 周期工具：`work_summary_period { from, to, kind?, offset?, content?, push? }`；`offset: 1` 取上一完整周期，不能与 `from`/`to` 同传。
 - 数据文件命名：`日报-YYYY-MM-DD.md`、`周报-from_to.md`、整月 `月报-YYYY-MM.md`、非整月 `月报-from_to.md`、自定义 `周期-from_to.md`。
+- 源数据归档：`_源数据` 只保留最近 60 个 `.md`；更旧的按数据日期分季度写入 `_归档/YYYY-QN.zip`，成功校验条目后才删原文件，失败只记一行且不阻断采集。
