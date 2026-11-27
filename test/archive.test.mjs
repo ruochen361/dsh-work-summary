@@ -75,7 +75,10 @@ assert.match(indexText, /\+2/)
 
 assert.match(sourceText, /归档：2 个源数据/)
 assert.match(sourceText, /2026-07-01 ~ 2026-07-02/)
-const logText = readFileSync(join(root, 'logs', 'dsh-work-summary-2026-11-26.log'), 'utf8')
+// 日志文件名按运行当天取，不按采集日期，所以取日志目录里最新的一个。
+const logDir = join(root, 'logs')
+const logFiles = readdirSync(logDir).filter(name => name.endsWith('.log')).sort()
+const logText = readFileSync(join(logDir, logFiles[logFiles.length - 1]), 'utf8')
 assert.match(logText, /归档：2 个源数据/, '归档结果应同时写运行日志')
 
 // 解压后逐字节比对；只比较被归档的两个文件。

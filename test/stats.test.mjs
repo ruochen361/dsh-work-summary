@@ -19,7 +19,7 @@ const fakeReact = {
 await import('../client.js?stats')
 assert.ok(spec && typeof spec.factory === 'function', 'client.js 应通过 __ModuleLoader__.load 注册 factory')
 const exports = spec.factory(name => (name === 'react' ? fakeReact : {}))
-const { buildTrend, boardStats, StatsView } = exports.__test
+const { buildTrend, boardStats, StatsView, MainlinePanel } = exports.__test
 
 const state = {
   today: '2026-11-26',
@@ -85,3 +85,27 @@ assert.ok(emptyView, '没有日报时应渲染空态而不是抛错')
 const noBoard = StatsView({ state: { ...state, board: { text: '' } }, onOpen() {} })
 assert.ok(noBoard, '有日报但空看板时应渲染趋势而不是除零')
 console.log('统计页渲染冒烟 = 通过')
+
+// 主线面板：只列未清，受阻在前，完成的不掺进来。
+const collectText = (node) => {
+  if (node === null || node === undefined || node === false) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(collectText).join(' ')
+  return collectText(node.props && node.props.children)
+}
+const panel = MainlinePanel({
+  today: '2026-11-27',
+  mainlines: [
+    { id: 'M-2026-11-25-01', title: '日报主线面板', workspace: 'F:\\dsh_plugins\\dsh-work-summary', status: '受阻', lastOutput: '2026-11-20', stallDays: 7 },
+    { id: 'M-2026-11-24-02', title: '周期聚合', workspace: 'F:\\novel', status: '进行中', lastOutput: '2026-11-26', stallDays: 1 },
+    { id: 'M-2026-11-20-03', title: '已收尾的交付', workspace: 'F:\\novel', status: '完成', lastOutput: '2026-11-20', stallDays: 7 },
+  ],
+})
+const panelText = collectText(panel)
+assert.match(panelText, /未清 2 条 \/ 共 3 条/, '只数未清主线')
+assert.match(panelText, /日报主线面板/)
+assert.ok(panelText.indexOf('日报主线面板') < panelText.indexOf('周期聚合'), '受阻应排在前面')
+assert.doesNotMatch(panelText, /已收尾的交付/, '完成的主线不列在面板里')
+const emptyPanel = collectText(MainlinePanel({ today: '2026-11-27', mainlines: [] }))
+assert.match(emptyPanel, /_主线\.md/, '没有账本时提示怎么生成')
+console.log('主线面板渲染 = 通过')

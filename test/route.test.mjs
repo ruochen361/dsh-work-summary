@@ -50,6 +50,27 @@ writeFileSync(`${probeData}\\日报-2026-11-26.md`, [
   '',
 ].join('\n'), 'utf8')
 
+// 主线账本：/state 要把它读成页面用的视图（未清、挂起天数）。
+writeFileSync(`${probeData}\\_主线.md`, [
+  '# 主线账本',
+  '',
+  '## M-2026-11-25-01 日报主线面板',
+  '',
+  '- 工作区：F:\\dsh_plugins\\dsh-work-summary',
+  '- 状态：进行中',
+  '- 首次产出：2026-11-25',
+  '- 最近产出：2026-11-26',
+  '- [x] 账本能读出来',
+  '',
+  '## M-2026-11-20-02 已收尾的交付',
+  '',
+  '- 工作区：F:\\novel',
+  '- 状态：完成',
+  '- 首次产出：2026-11-20',
+  '- 最近产出：2026-11-20',
+  '',
+].join('\n'), 'utf8')
+
 // 看板：老格式 + 新元数据 + 已完成条目，覆盖解析、改元数据、跨栏移动。
 writeFileSync(`${probeData}\\看板.md`, [
   '# 工作看板',
@@ -154,6 +175,18 @@ console.log('热力图校验 =',
   /^\d{4}-\d{2}-\d{2}$/.test(statePayload.today)
   && heatSample && heatSample.outputs === 2 && heatSample.score === heatSample.lines + 6
   && heatShort && heatShort.outputs === 0 && heatShort.score === heatShort.lines
+    ? '通过'
+    : '不符合预期')
+
+// 主线面板：/state 返回账本视图，未清与挂起天数按今天算。
+const mainlinePanel = statePayload.mainlines || []
+const panelOpen = mainlinePanel.find(item => item.id === 'M-2026-11-25-01')
+const panelDone = mainlinePanel.find(item => item.id === 'M-2026-11-20-02')
+console.log('主线面板 =', JSON.stringify(mainlinePanel))
+console.log('主线面板校验 =',
+  mainlinePanel.length === 2
+  && panelOpen && panelOpen.status === '进行中' && panelOpen.title === '日报主线面板'
+  && panelDone && panelDone.status === '完成'
     ? '通过'
     : '不符合预期')
 

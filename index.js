@@ -34,8 +34,8 @@ const SETTINGS_FILE = join(DATA_HOME, 'settings.json')
 const DEFAULTS = {
   /** 数据目录：日报、看板、源数据、日志都在这里；设置页可改。 */
   reportDir: DATA_HOME,
-  /** 采集脚本扫描的工作区根（collect-day.ps1 -Workspace）；默认也是数据根。 */
-  workspace: DATA_HOME,
+  /** 额外扫描的工作区根（可选）：留空时只按 DSH 会话自动发现工作区。 */
+  workspace: '',
   /** 脚本目录：默认随插件仓库。 */
   scriptDir: join(PLUGIN_DIR, 'scripts'),
   /** 日报正文规则；默认随插件仓库。 */
@@ -70,6 +70,8 @@ const DEFAULTS = {
   monthScheduleTitle: '每月工作月报',
   /** 日报保存时的软校验；只提醒，不阻断落盘。 */
   quality: { minEvidence: 3 },
+  /** 主线账本：连续这么多天没有新产出就判「受阻」。 */
+  mainline: { stallDays: 3 },
   /** 运行日志目录；留空表示 `<reportDir>\_日志`。设置页改的是这个键。 */
   logDir: '',
 }
@@ -215,7 +217,7 @@ function settingsPayload(states, config) {
     reportDir: config.reportDir,
     reportDirDefault: DATA_HOME,
     workspace: config.workspace,
-    workspaceDefault: DATA_HOME,
+    workspaceDefault: '',
     logDir: logDirOf(config),
     logDirDefault: join(config.reportDir, '_日志'),
     logPattern: 'dsh-work-summary-YYYY-MM-DD.log',
@@ -277,16 +279,17 @@ function buildTemplate(date) {
     `# 工作日报 · ${date}`,
     '',
     '## 一、今日概览',
-    '（3–5 句：今天的主线、投入方向、一句话结论）',
+    '（表格 3–5 行，一行一条主线：`| 主线 | 工作区 | 今日产出 | 状态 | 下一步 |` + `|---|---|---|---|---|`；表后一句话结论）',
     '',
     '## 二、做了什么',
-    '（按主题分组，不按时间流水账；每条写清「做了什么 → 落在哪个路径/模块」，并给证据）',
+    '（按工作区分块：`### 工作区名（路径）`；块内每条主线一个 `#### M-YYYY-MM-DD-NN 标题` 小节，写清做了什么 → 落在哪个路径/模块 + 证据）',
+    '（`####` 块内固定三行：`- 工作区：绝对路径`、`- 状态：进行中/完成/受阻/放弃`（四值精确，勿写「未完成」）、`- 判据：可验收的一句话`；新主线的 ID 日期用今天、序号两位；补写往日日报只补证据，状态与判据以最近一次为准）',
     '',
     '## 三、结果与产出',
-    '（表格：产出物 | 路径 | 状态（完成/进行中/待验证）| 说明）',
+    '（表格：产出物 | 路径 | 状态（完成/进行中/待验证）| 说明 | 主线）',
     '',
     '## 四、问题与风险',
-    '（暴露的问题、未通过的验证、遗留脏数据；每条给出影响面）',
+    '（暴露的问题、未通过的验证、遗留脏数据；挂着的主线写 M-ID 与已挂天数，每条给出影响面）',
     '',
     '## 五、后续建议',
     '（3–6 条，按优先级；每条：建议 | 为什么现在做 | 预估工作量 | 何时做）',
@@ -554,13 +557,267 @@ function qualityWarnings(content, minEvidence) {
   return warnings
 }
 
+/** 主线 ID 的形态；日期段用于区分「当天新建」与「引用旧账」。 */
+const MAINLINE_ID_SOURCE = 'M-\\d{4}-\\d{2}-\\d{2}-\\d{2}'
+const MAINLINE_HEADING = new RegExp(`^####\\s+(${MAINLINE_ID_SOURCE})\\s*(.*)$`)
+const MAINLINE_ANY = new RegExp(`(${MAINLINE_ID_SOURCE})`, 'g')
+const MAINLINE_STATUSES = ['进行中', '完成', '受阻', '放弃']
+const LEDGER_FILE = '_主线.md'
+
+/** 把状态文案归一；只认四个值本身或以其开头，否定式（未完成/待完成）一律返回空串。 */
+function normalizeStatus(value) {
+  const text = String(value ?? '').trim()
+  if (!text) return ''
+  if (MAINLINE_STATUSES.includes(text)) return text
+  if (/^(?:未|待|尚未|没有)/.test(text)) return ''
+  return MAINLINE_STATUSES.find(status => text.startsWith(status)) ?? ''
+}
+
+/** 账本日期：只认 YYYY-MM-DD；`—`、空串、带说明的文字一律当没写。 */
+function ledgerDate(value) {
+  const text = String(value ?? '').trim()
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : ''
+}
+
+/** 读文本文件，读不到返回空串（账本不存在是正常状态）。 */
+async function readTextIfExists(path) {
+  try {
+    return await readFile(path, 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 解析 `_主线.md` 账本。只认 `## M-... 标题` 与固定字段/判据行，其余行当备注忽略。
+ * @param {string} text - 账本正文。
+ * @returns {Array<object>} 主线条目，保持文件里的顺序。
+ */
+function parseLedger(text) {
+  const entries = []
+  let current = null
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim()
+    const heading = new RegExp(`^##\\s+(${MAINLINE_ID_SOURCE})\\s*(.*)$`).exec(line)
+    if (heading) {
+      current = {
+        id: heading[1], title: heading[2].trim(), workspace: '', status: '进行中',
+        first: '', last: '', board: '', criteria: [], notes: [],
+      }
+      entries.push(current)
+      continue
+    }
+    if (!current) continue
+    const criterion = /^-\s*\[( |x|X)\]\s*(.+)$/.exec(line)
+    if (criterion) {
+      current.criteria.push({ done: criterion[1].toLowerCase() === 'x', text: criterion[2].trim() })
+      continue
+    }
+    const field = /^-\s*(工作区|状态|首次产出|最近产出|判据|看板|备注)\s*[：:]\s*(.*)$/.exec(line)
+    if (field) {
+      const key = field[1]
+      const value = field[2].trim()
+      if (key === '工作区') current.workspace = value.replace(/^`|`$/g, '')
+      else if (key === '状态') current.status = normalizeStatus(value) || '进行中'
+      else if (key === '首次产出') current.first = ledgerDate(value)
+      else if (key === '最近产出') current.last = ledgerDate(value)
+      else if (key === '看板') current.board = value
+      else if (key === '判据') {
+        for (const part of value.split(/[；;]/).map(item => item.trim()).filter(Boolean)) {
+          current.criteria.push({ done: false, text: part })
+        }
+      } else if (key === '备注' && value) current.notes.push(value)
+      continue
+    }
+    if (line.startsWith('- ')) {
+      const note = line.slice(2).trim()
+      if (note) current.notes.push(note)
+    }
+  }
+  return entries
+}
+
+/**
+ * 从日报正文里抽出 `#### M-... 标题` 小节。遇到其他标题就结束当前小节，
+ * 所以主线小节要写在「二、做了什么」内部、不要跨到下一节。
+ * @param {string} content - 日报正文。
+ * @returns {Array<object>} 每条的 id / 标题 / 工作区 / 状态 / 判据 / 看板。
+ */
+function parseReportMainlines(content) {
+  const blocks = []
+  let current = null
+  for (const raw of String(content).split(/\r?\n/)) {
+    const line = raw.trim()
+    const heading = MAINLINE_HEADING.exec(line)
+    if (heading) {
+      current = {
+        id: heading[1], title: heading[2].trim(), workspace: '', status: '', statusRaw: '', board: '', criteria: [],
+      }
+      blocks.push(current)
+      continue
+    }
+    if (/^#{1,5}\s/.test(line)) { current = null; continue }
+    if (!current) continue
+    const criterion = /^-\s*\[( |x|X)\]\s*(.+)$/.exec(line)
+    if (criterion) {
+      current.criteria.push({ done: criterion[1].toLowerCase() === 'x', text: criterion[2].trim() })
+      continue
+    }
+    const field = /^-\s*(工作区|状态|判据|看板)\s*[：:]\s*(.*)$/.exec(line)
+    if (!field) continue
+    const key = field[1]
+    const value = field[2].trim()
+    if (key === '工作区') current.workspace = value.replace(/^`|`$/g, '')
+    else if (key === '状态') { current.statusRaw = value; current.status = normalizeStatus(value) }
+    else if (key === '看板') current.board = value
+    else if (key === '判据') {
+      for (const part of value.split(/[；;]/).map(item => item.trim()).filter(Boolean)) {
+        current.criteria.push({ done: false, text: part })
+      }
+    }
+  }
+  return blocks
+}
+
+/**
+ * 主线引用校验：正文里出现的每个 M-ID 必须「账号本里的旧 ID」或「日期等于日报日期的新 ID」，
+ * 新 ID 还必须写成 `####` 小节，否则不知道标题与判据。全部问题一次返回，便于一次修完。
+ * @param {string} content - 日报正文。
+ * @param {Array<object>} blocks - parseReportMainlines 的结果。
+ * @param {string} date - 日报日期。
+ * @param {Array<object>} ledger - 现有账本条目。
+ * @returns {string[]} 问题列表；为空表示通过。
+ */
+function validateReportMainlines(content, blocks, date, ledger) {
+  const known = new Set(ledger.map(entry => entry.id))
+  const inHeading = new Set(blocks.map(block => block.id))
+  const problems = []
+  const seen = new Set()
+  // 代码块里可能引用示例 ID（模板、命令输出），不该当成主线引用去报错。
+  const plain = String(content).replace(/^[ \t]*```[\s\S]*?^[ \t]*```[ \t]*$/gm, '')
+  for (const match of plain.matchAll(MAINLINE_ANY)) {
+    const id = match[1]
+    if (seen.has(id)) continue
+    seen.add(id)
+    const idDate = id.slice(2, 12)
+    if (idDate > date) {
+      problems.push(`主线 ${id} 的日期晚于日报日期 ${date}`)
+    } else if (idDate !== date && !known.has(id)) {
+      problems.push(`主线 ${id} 不在 ${LEDGER_FILE} 账本里：新主线的 ID 日期要等于日报日期 ${date}，旧主线要沿用账本里的 ID`)
+    } else if (idDate === date && !known.has(id) && !inHeading.has(id)) {
+      problems.push(`新主线 ${id} 还没有小节：在「二、做了什么」里写成 \`#### ${id} 标题\``)
+    }
+  }
+  for (const block of blocks) {
+    if (!block.statusRaw) {
+      problems.push(`主线 ${block.id} 缺少 \`- 状态：\` 行：只能是 进行中 / 完成 / 受阻 / 放弃`)
+    } else if (!block.status) {
+      problems.push(`主线 ${block.id} 的状态只能是 进行中 / 完成 / 受阻 / 放弃，收到：${block.statusRaw}`)
+    }
+  }
+  // 单数字序号不会被上面的正则识别，会静默漏账；这里单独点出来，让写的人补成两位。
+  const shortIds = new Set()
+  for (const match of plain.matchAll(/M-\d{4}-\d{2}-\d{2}-\d(?!\d)/g)) {
+    if (shortIds.has(match[0])) continue
+    shortIds.add(match[0])
+    problems.push(`主线 ${match[0]} 的序号要两位，例如 M-${date}-01`)
+  }
+  return problems
+}
+
+/**
+ * 把日报里的主线小节并入账本：新 ID 追加，旧 ID 只更新标题 / 工作区 / 状态 / 判据 / 看板，
+ * 最近产出取较大日期（补写旧日报不会把最近产出往回拨）。
+ * @param {Array<object>} ledger - 现有条目。
+ * @param {Array<object>} blocks - 日报里的小节。
+ * @param {string} date - 日报日期。
+ * @returns {Array<object>} 合并后的条目。
+ */
+function mergeLedger(ledger, blocks, date) {
+  const map = new Map(ledger.map(entry => [entry.id, {
+    ...entry, criteria: entry.criteria.map(item => ({ ...item })), notes: [...entry.notes],
+  }]))
+  for (const block of blocks) {
+    const entry = map.get(block.id) ?? {
+      id: block.id, title: '', workspace: '', status: '进行中',
+      first: date, last: date, board: '', criteria: [], notes: [],
+    }
+    // 补写旧日报只补证据；状态与判据进度只在「不早于最近产出」时更新，避免把完成回拨成进行中。
+    const forward = !entry.last || date >= entry.last
+    if (block.title) entry.title = block.title
+    if (block.workspace) entry.workspace = block.workspace
+    if (forward && block.status) entry.status = block.status
+    if (block.board) entry.board = block.board
+    if (forward && block.criteria.length > 0) entry.criteria = block.criteria
+    if (!entry.first || date < entry.first) entry.first = date
+    if (!entry.last || date > entry.last) entry.last = date
+    map.set(block.id, entry)
+  }
+  return [...map.values()]
+}
+
+/**
+ * 给账本条目算挂起天数与展示状态：完成 / 放弃保持原状，其余超过阈值显示「受阻」。
+ * @param {Array<object>} entries - 账本条目。
+ * @param {string} today - 参考日期。
+ * @param {number} stallDays - 判定受阻的天数。
+ * @returns {Array<object>} 用于输出与提醒的视图。
+ */
+function mainlineView(entries, today, stallDays) {
+  return entries.map((entry) => {
+    const last = ledgerDate(entry.last)
+    const stall = last ? Math.max(0, daysBetween(last, today)) : 0
+    const open = entry.status !== '完成' && entry.status !== '放弃'
+    return {
+      id: entry.id,
+      title: entry.title || '（未命名）',
+      workspace: entry.workspace,
+      status: open && stall >= stallDays ? '受阻' : entry.status,
+      lastOutput: last,
+      stallDays: stall,
+    }
+  })
+}
+
+/** 把账本条目写回 Markdown：顺序即条目顺序，字段格式与 parseLedger 对应。 */
+function ledgerMarkdown(entries) {
+  const out = [
+    '# 主线账本',
+    '',
+    '> 由 `daily_report_save` 自动维护：日报里的 `#### M-YYYY-MM-DD-NN 标题` 会新增或更新这里，不要手工改 ID。',
+    '',
+  ]
+  for (const entry of entries) {
+    out.push(`## ${entry.id} ${entry.title}`.trim())
+    out.push('')
+    out.push(`- 工作区：${entry.workspace || '（未标注）'}`)
+    out.push(`- 状态：${entry.status}`)
+    out.push(`- 首次产出：${entry.first || '—'}`)
+    out.push(`- 最近产出：${entry.last || '—'}`)
+    if (entry.board) out.push(`- 看板：${entry.board}`)
+    for (const criterion of entry.criteria) {
+      out.push(`- [${criterion.done ? 'x' : ' '}] ${criterion.text}`)
+    }
+    for (const note of entry.notes ?? []) out.push(`- 备注：${note}`)
+    out.push('')
+  }
+  return out.join('\n')
+}
+
+/** 读取 `mainline.stallDays`：支持嵌套与扁平点号键，非法值退回 3。 */
+function stallDaysOf(config) {
+  const mainline = config?.mainline
+  const nested = mainline && typeof mainline === 'object' ? mainline.stallDays : mainline
+  const value = Number(config?.['mainline.stallDays'] ?? nested ?? DEFAULTS.mainline.stallDays)
+  return Number.isInteger(value) && value > 0 ? value : DEFAULTS.mainline.stallDays
+}
+
 /**
  * 逐日热力值：非空行数 + 产出条目数 × 3。
  * 行数代表当天写了多少，产出条目代表落地的结果；权重 3 让「有产出」的一天明显亮于「写得长但没产出」。
  * @param {string} content - 日报正文。
  * @returns {{ lines: number, outputs: number, score: number }} 统计值。
- */
-function heatStats(content) {
+ */function heatStats(content) {
   const text = String(content)
   const lines = text.split(/\r?\n/).filter((line) => {
     const trimmed = line.trim()
@@ -606,6 +863,78 @@ function clip(text, max) {
 }
 
 /**
+ * 汇总区间内的主线：日报 `#### M-...` 小节给工作区/状态/最近推进，账本补首次产出与判据勾选。
+ * 账本里未清、但区间日报没有小节的条目也会带上（标「本期未推进」），便于看出跨期停滞。
+ * @param {string[]} days - 有日报的日期（升序）。
+ * @param {Map<string, string>} daily - 日期 → 日报正文。
+ * @param {Array<object>} ledger - parseLedger 的结果。
+ * @param {string} endDate - 区间结束日，用它算挂起天数。
+ * @param {number} stallDays - 判定受阻的天数。
+ * @returns {Array<object>} 主线视图，按首次产出排序。
+ */
+function collectPeriodMainlines(days, daily, ledger, endDate, stallDays) {
+  const map = new Map()
+  const ensure = (id) => {
+    if (!map.has(id)) {
+      map.set(id, {
+        id, title: '', workspace: '', status: '进行中', first: '', last: '',
+        criteriaDone: 0, criteriaTotal: 0, touched: false, fromLedger: false,
+      })
+    }
+    return map.get(id)
+  }
+  for (const entry of ledger) {
+    const started = String(entry.id ?? '').match(/^M-(\d{4}-\d{2}-\d{2})-\d{2}$/)
+    // 账本里可能有区间结束后才出现的主线，不能倒灌进历史周期的「本期未推进」。
+    if (!started || started[1] > endDate) continue
+    const item = ensure(entry.id)
+    item.fromLedger = true
+    if (entry.title) item.title = entry.title
+    if (entry.workspace) item.workspace = entry.workspace
+    if (entry.status) item.status = entry.status
+    const first = ledgerDate(entry.first)
+    const last = ledgerDate(entry.last)
+    if (first) item.first = first
+    if (last) item.last = last
+    item.criteriaDone = entry.criteria.filter(criterion => criterion.done).length
+    item.criteriaTotal = entry.criteria.length
+  }
+  for (const day of days) {
+    for (const block of parseReportMainlines(daily.get(day))) {
+      const item = ensure(block.id)
+      item.touched = true
+      if (block.title) item.title = block.title
+      if (block.workspace) item.workspace = block.workspace
+      if (block.status) item.status = block.status
+      if (!item.first || day < item.first) item.first = day
+      if (!item.last || day > item.last) item.last = day
+      if (!item.fromLedger && block.criteria.length > 0) {
+        item.criteriaDone = block.criteria.filter(criterion => criterion.done).length
+        item.criteriaTotal = block.criteria.length
+      }
+    }
+  }
+  const view = []
+  for (const item of map.values()) {
+    if (item.first && item.first > endDate) continue
+    const open = item.status !== '完成' && item.status !== '放弃'
+    if (!open && !item.touched) continue
+    const last = ledgerDate(item.last)
+    const stall = last ? Math.max(0, daysBetween(last, endDate)) : 0
+    view.push({ ...item, status: open && stall >= stallDays ? '受阻' : item.status, stallDays: stall })
+  }
+  return view.sort((a, b) => (a.first || '').localeCompare(b.first || '') || a.id.localeCompare(b.id))
+}
+
+/** 工作区展示名：能取到末级目录就「末级（全路径）」，取不到就原样。 */
+function periodWorkspaceLabel(workspace) {
+  const path = String(workspace || '').split(/[,，]/)[0].trim()
+  if (!path) return '（未标工作区）'
+  const leaf = path.split(/[\\/]/).filter(Boolean).pop()
+  return leaf && leaf !== path ? `${leaf}（${path}）` : path
+}
+
+/**
  * 不传 content 时的兜底草稿：按区间日报的六节与看板拼出四节，保证验收里「直接产出可读周报」。
  * 只做摘录和计数，不做跨天推断；模型可以在此基础上改写后再提交。
  * @param {{ from: string, to: string, kind: string, span: number, wholeMonth: boolean }} range - 区间。
@@ -615,11 +944,12 @@ function clip(text, max) {
  * @param {string} today - 今天 YYYY-MM-DD（用于算待办已挂天数）。
  * @returns {string} 四节正文。
  */
-function composePeriodDraft(range, days, daily, board, today) {
+function composePeriodDraft(range, days, daily, board, today, ledger = [], stallDays = 3) {
   const spec = PERIOD_KINDS[range.kind] ?? PERIOD_KINDS.custom
   const labels = periodSectionLabels(range.kind)
   const covered = days.filter(day => daily.has(day))
   const missing = days.filter(day => !daily.has(day))
+  const mainlines = collectPeriodMainlines(covered, daily, ledger, range.to, stallDays)
   const heading = range.kind === 'month' && range.wholeMonth
     ? range.from.slice(0, 7)
     : `${range.from} ~ ${range.to}`
@@ -631,12 +961,31 @@ function composePeriodDraft(range, days, daily, board, today) {
   out.push('')
   if (covered.length === 0) {
     out.push('_区间内没有日报，无法从记录里归纳主线。_')
+  } else if (mainlines.length === 0) {
+    out.push('_区间内日报没有主线小节，账本里也没有未清条目。_')
   } else {
-    out.push('按天摘录日报「今日概览」里的主线，未做跨天推断：')
+    out.push('按工作区分组；「本期未推进」是账本里有、区间日报没有小节的未清主线。')
     out.push('')
-    for (const day of covered) {
-      const first = sectionLines(daily.get(day), '一')[0]
-      if (first) out.push(`- **${day.slice(5)}**：${clip(cleanItem(first), 180)}`)
+    const groups = new Map()
+    for (const item of mainlines) {
+      const key = periodWorkspaceLabel(item.workspace)
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key).push(item)
+    }
+    for (const [workspace, items] of groups) {
+      out.push(`### ${workspace}`)
+      out.push('')
+      for (const item of items) {
+        const from = item.first ? item.first.slice(5) : ''
+        const to = item.last ? item.last.slice(5) : ''
+        const span = from && from === to ? from : `${from || '—'} → ${to || '—'}`
+        const parts = [item.status]
+        if (item.criteriaTotal > 0) parts.push(`判据 ${item.criteriaDone}/${item.criteriaTotal}`)
+        if (item.stallDays > 0) parts.push(`挂起 ${item.stallDays} 天`)
+        if (!item.touched) parts.push('本期未推进')
+        out.push(`- ${item.id} ${item.title}：${span}（${parts.join('，')}）`)
+      }
+      out.push('')
     }
   }
   out.push('')
@@ -923,6 +1272,33 @@ function psQuote(value) {
 const renderText = (_args, value) => [{ type: 'text', text: value.text }]
 
 /** 侧边栏页面要的一份只读快照：看板全文 + 最近若干天日报正文。 */
+/**
+ * 从源数据「0. 工作区（近两天活跃）」表格里解析出工作区清单。
+ * 解析失败返回空数组：页面和工具都不该因为一张表崩掉。
+ * @param {string} text - 源数据正文。
+ * @returns {Array<{ name: string, path: string, sessions: number, tools: number, files: number }>}
+ */
+function parseWorkspaceTable(text) {
+  const lines = String(text).split(/\r?\n/)
+  const start = lines.findIndex(line => /^##\s*0\.\s*工作区/.test(line.trim()))
+  if (start < 0) return []
+  const out = []
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const line = lines[i].trim()
+    if (/^##\s/.test(line)) break
+    const match = /^\|\s*(.+?)\s*\|\s*`(.+)`\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)/.exec(line)
+    if (!match) continue
+    out.push({
+      name: match[1].trim(),
+      path: match[2].trim(),
+      sessions: Number(match[3]),
+      tools: Number(match[4]),
+      files: Number(match[5]),
+    })
+  }
+  return out
+}
+
 async function readState(config) {
   const board = await readBoard(config.reportDir)
   const lines = board.text.split(/\r?\n/).map(line => line.trim())
@@ -957,6 +1333,27 @@ async function readState(config) {
   } catch {
     periodNames = []
   }
+  // 工作区清单以最近一份源数据为准：它由采集脚本从 DSH 会话里算出来，页面只读展示。
+  let workspaces = []
+  let workspaceSource = null
+  try {
+    const sourceNames = (await readdir(join(config.reportDir, '_源数据')))
+      .filter(name => /^\d{4}-\d{2}-\d{2}\.md$/.test(name)).sort().reverse()
+    if (sourceNames.length > 0) {
+      workspaces = parseWorkspaceTable(await readFile(join(config.reportDir, '_源数据', sourceNames[0]), 'utf8'))
+      workspaceSource = sourceNames[0].slice(0, 10)
+    }
+  } catch {
+    workspaces = []
+  }
+  // 主线视图：账本由 daily_report_save 维护，这里只读，页面用来一眼看未清与受阻。
+  let mainlines = []
+  try {
+    const ledgerText = await readTextIfExists(join(config.reportDir, LEDGER_FILE))
+    mainlines = mainlineView(parseLedger(ledgerText), dateInZone(config.scheduleTimeZone), stallDaysOf(config))
+  } catch {
+    mainlines = []
+  }
   for (const name of periodNames.sort().reverse().slice(0, 40)) {
     try {
       const content = await readFile(join(config.reportDir, name), 'utf8')
@@ -977,6 +1374,9 @@ async function readState(config) {
     reportDir: config.reportDir,
     today: dateInZone(config.scheduleTimeZone),
     updatedAt: new Date().toISOString(),
+    workspaces,
+    workspaceSource,
+    mainlines,
     board: {
       text: board.text,
       open: board.open.length,
@@ -1107,7 +1507,7 @@ export function apply(ctx, rawConfig) {
   // 装好第一次激活就把目录建出来；之后所有产物都落在它们下面。建不出来也不该拖垮插件。
   void mkdir(DATA_HOME, { recursive: true }).catch(() => {})
   void mkdir(config.reportDir, { recursive: true }).catch(() => {})
-  void mkdir(config.workspace, { recursive: true }).catch(() => {})
+  if (config.workspace) void mkdir(config.workspace, { recursive: true }).catch(() => {})
 
   ctx.tools.register({
     name: 'daily_report_collect',
@@ -1134,6 +1534,21 @@ export function apply(ctx, rawConfig) {
           lines: { type: 'integer' },
           bytes: { type: 'integer' },
           headings: { type: 'array', items: { type: 'string' } },
+          workspaces: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['name', 'path', 'sessions', 'tools', 'files'],
+              properties: {
+                name: { type: 'string' },
+                path: { type: 'string' },
+                sessions: { type: 'integer' },
+                tools: { type: 'integer' },
+                files: { type: 'integer' },
+              },
+            },
+          },
           boardOpen: { type: 'integer' },
           template: { type: 'string' },
         },
@@ -1141,6 +1556,9 @@ export function apply(ctx, rawConfig) {
       render: (_args, value) => [{
         type: 'text',
         text: `已采集 ${value.date} → ${value.sourcePath}（${value.lines} 行，看板未完成 ${value.boardOpen} 条）。`
+          + (value.workspaces?.length
+            ? `\n\n工作区（近两天活跃）：\n${value.workspaces.map(w => `- ${w.name} \`${w.path}\`（会话 ${w.sessions}，当日改动 ${w.files}）`).join('\n')}`
+            : '\n\n未发现活跃工作区。')
           + (value.headings?.length
             ? `\n\n采集到的小节：\n${value.headings.map(h => `- ${h.replace(/^##\s*/, '')}`).join('\n')}`
             : '')
@@ -1155,8 +1573,9 @@ export function apply(ctx, rawConfig) {
         'collect-day.ps1',
         [
           '-Date', date,
-          '-Workspace', config.workspace,
+          ...(config.workspace ? ['-Workspace', config.workspace] : []),
           '-ReportDir', config.reportDir,
+          '-StallDays', String(stallDaysOf(config)),
           ...(args.sessions === false ? ['-NoSessions'] : []),
         ],
         exec.signal,
@@ -1183,6 +1602,7 @@ export function apply(ctx, rawConfig) {
         lines: lines.length,
         bytes: Buffer.byteLength(text, 'utf8'),
         headings,
+        workspaces: parseWorkspaceTable(text),
         boardOpen: board.open.length,
         template: buildTemplate(date),
       }
@@ -1195,6 +1615,8 @@ export function apply(ctx, rawConfig) {
       '校验并落盘当天日报，然后把它「六、明日开场清单」推进看板。'
       + '正文必须包含六个固定小节（一、今日概览 … 六、明日开场清单）；缺节或留占位符会直接报错且不写文件，'
       + '按报错修好后重调即可。已存在同名日报会被整篇覆盖。'
+      + '主线写成 `#### M-YYYY-MM-DD-NN 标题` 小节（内部含 工作区 / 状态 / 判据），工具会据此维护 `_主线.md` 账本；'
+      + '引用账本外的旧 ID、新 ID 缺小节或非法状态都会报错且不写文件。'
       + '落盘后会做证据密度、空话词、建议可执行性的软校验，提醒放在 warnings 与 text 里，不阻断写入。',
     parameters: {
       type: 'object',
@@ -1222,6 +1644,23 @@ export function apply(ctx, rawConfig) {
             items: { type: 'string' },
             description: '软校验提醒（证据密度 / 空话词 / 建议可执行性）；为空表示没发现问题。',
           },
+          mainlines: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['id', 'title', 'workspace', 'status', 'lastOutput', 'stallDays'],
+              properties: {
+                id: { type: 'string' },
+                title: { type: 'string' },
+                workspace: { type: 'string' },
+                status: { type: 'string' },
+                lastOutput: { type: 'string' },
+                stallDays: { type: 'integer' },
+              },
+            },
+          },
+          stalled: { type: 'array', items: { type: 'string' } },
           text: { type: 'string' },
         },
       },
@@ -1237,11 +1676,28 @@ export function apply(ctx, rawConfig) {
       const body = content.replace(/^#[^\n]*\n/m, '')
       if (body.trim().length < 200) problems.push(`正文过短（${body.trim().length} 字符），确认不是只写了骨架`)
       if (/\bTODO\b|待填|\{\{/.test(content)) problems.push('仍留有占位符（TODO / 待填 / {{…}}）')
+      // 主线：先校验引用（未知旧 ID、日期不属于今天且不在账本、新 ID 缺小节、非法状态），
+      // 任一问题都按硬错误处理——日报与账本都不写，避免账本出现半截条目。
+      const ledgerPath = join(config.reportDir, LEDGER_FILE)
+      const ledger = parseLedger(await readTextIfExists(ledgerPath))
+      const blocks = parseReportMainlines(content)
+      problems.push(...validateReportMainlines(content, blocks, date, ledger))
       if (problems.length > 0) {
         throw new Error(`日报未写入，先修正：\n- ${problems.join('\n- ')}`)
       }
       // 质量检查放在硬校验之后、写盘之前：只收集提醒，不改变落盘结果。
+      const merged = blocks.length > 0 ? mergeLedger(ledger, blocks, date) : ledger
+      const stallDays = stallDaysOf(config)
+      const views = mainlineView(merged, date, stallDays)
+      const todayIds = new Set(blocks.map(block => block.id))
+      const mainlines = views.filter(view => todayIds.has(view.id) || view.status === '受阻')
+      const stalled = views.filter(view => view.status === '受阻').map(view => view.id)
       const warnings = qualityWarnings(content, minEvidenceOf(config))
+      const riskText = sectionLines(content, '四').join('\n')
+      for (const view of views) {
+        if (view.status !== '受阻' || riskText.includes(view.id)) continue
+        warnings.push(`主线 ${view.id} 已挂起 ${view.stallDays} 天，第四节没有提到`)
+      }
 
       const stamp = stampInZone(config.scheduleTimeZone)
       const withFooter = /数据来源：/.test(content)
@@ -1249,6 +1705,8 @@ export function apply(ctx, rawConfig) {
         : `${content.replace(/\s*$/, '')}\n\n---\n数据来源：\`_源数据\\${date}.md\` ｜ 生成时间：${stamp}\n`
       const reportPath = join(config.reportDir, `日报-${date}.md`)
       await mkdir(config.reportDir, { recursive: true })
+      // 账本先写：即使后面推看板失败，主线状态也已经记下来了。
+      if (blocks.length > 0) await writeFile(ledgerPath, ledgerMarkdown(merged), 'utf8')
       await writeFile(reportPath, withFooter, 'utf8')
 
       const shouldPush = args.push ?? config.pushOnSave
@@ -1274,6 +1732,9 @@ export function apply(ctx, rawConfig) {
       const warningText = warnings.length > 0
         ? `质量提醒（不影响落盘）：\n- ${warnings.join('\n- ')}`
         : ''
+      const mainlineText = mainlines.length > 0
+        ? `主线：${mainlines.map(view => `${view.id} ${view.title}（${view.status}${view.status === '受阻' ? `，挂起 ${view.stallDays} 天` : ''}）`).join('；')}`
+        : ''
       return {
         date,
         reportPath,
@@ -1281,7 +1742,9 @@ export function apply(ctx, rawConfig) {
         skipped,
         boardOpen: board.open.length,
         warnings,
-        text: [summary, pushText, warningText].filter(Boolean).join('\n'),
+        mainlines,
+        stalled,
+        text: [summary, mainlineText, pushText, warningText].filter(Boolean).join('\n'),
       }
     },
   })
@@ -1350,10 +1813,12 @@ export function apply(ctx, rawConfig) {
       }
 
       const board = await readBoard(config.reportDir)
+      const ledger = parseLedger(await readTextIfExists(join(config.reportDir, LEDGER_FILE)))
+      const stallDays = stallDaysOf(config)
       const provided = typeof args.content === 'string' && args.content.trim() !== ''
       let content = provided
         ? String(args.content)
-        : composePeriodDraft(range, days, daily, board, dateInZone(config.scheduleTimeZone))
+        : composePeriodDraft(range, days, daily, board, dateInZone(config.scheduleTimeZone), ledger, stallDays)
 
       const problems = []
       const missing = missingPeriodSections(content, range.kind)
@@ -1633,13 +2098,15 @@ export function apply(ctx, rawConfig) {
             touched = true
             if (typeof body.workspace !== 'string') throw new Error('workspace 应为字符串')
             const value = body.workspace.trim()
-            if (!/^[A-Za-z]:[\\/]|^\\\\|^\//.test(value)) {
-              throw new Error('工作空间要写绝对路径，比如 D:\\projects')
+            if (value !== '' && !/^[A-Za-z]:[\\/]|^\\\\|^\//.test(value)) {
+              throw new Error('额外工作区要写绝对路径，比如 D:\\projects；不想固定就留空')
             }
-            await mkdir(value, { recursive: true })
+            if (value !== '') await mkdir(value, { recursive: true })
             await writeSettings({ workspace: value })
             config.workspace = value
-            await logLine(config, 'info', `工作空间改为 ${value}（日报会扫描这里当天的改动）`)
+            await logLine(config, 'info', value
+              ? `额外工作区改为 ${value}（除自动发现外，固定也扫这里）`
+              : '额外工作区已清空（只按 DSH 会话自动发现工作区）')
           }
           if (body.logDir !== undefined) {
             touched = true

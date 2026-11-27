@@ -21,7 +21,10 @@ _日志/
 settings.json
 docs/ROADMAP.md
 
-# 测试临时目录
+# 探针 / 测试临时目录
+_probe/
 test/.tmp-period/
 test/.tmp-quality/
 test/.tmp-archive/
+test/.tmp-workspace/
+test/.tmp-mainline/

@@ -4,14 +4,22 @@
 #   pwsh -NoProfile -File collect-day.ps1 -Date 2026-10-28
 #   pwsh -NoProfile -File collect-day.ps1 -NoSessions  # 跳过会话解析（更快）
 # 输出：<ReportDir>\_源数据\YYYY-MM-DD.md（同时打印路径）
-# 本脚本属于 dsh-work-summary 插件仓库；扫哪里由 -Workspace 决定，产物写哪由 -ReportDir 决定。
-# 默认数据根是 ~/.dsh/dsh-work-summary（插件激活时创建），插件调用时会把两个参数都显式传进来。
+# 本脚本属于 dsh-work-summary 插件仓库；扫哪些工作区由 DSH 会话自动发现，产物写哪由 -ReportDir 决定。
+# 默认数据根是 ~/.dsh/dsh-work-summary（插件激活时创建），插件调用时会把参数显式传进来。
+#
+# 工作区规则（R29）：
+#   - 从 ~/.dsh/sessions 里近两天（D-1、D 两个日历日）有活动的会话 cwd 自动发现；
+#   - junction / 符号链接先解析成真实路径再去重；
+#   - _工作区.md 里可以写「别名」与「忽略」，首次运行自动生成；
+#   - 不要求 .git / AGENTS.md / package.json，任何存在的工作目录都算；
+#   - 最多列 12 个工作区、每个工作区最多列 400 个改动文件、12 个 Git 仓库。
 
 param(
   [string]$Date = (Get-Date -Format 'yyyy-MM-dd'),
   [string]$DshHome = (Join-Path $HOME '.dsh'),
-  [string]$Workspace = (Join-Path $DshHome 'dsh-work-summary'),
+  [string]$Workspace = '',
   [string]$ReportDir = (Join-Path $DshHome 'dsh-work-summary'),
+  [int]$StallDays = 3,
   [switch]$NoSessions
 )
 
@@ -23,6 +31,8 @@ catch { throw "日期格式应为 yyyy-MM-dd，收到：$Date" }
 
 $dayStart = $day
 $dayEnd = $day.AddDays(1)
+# 工作区发现按日历日算：昨天与今天两个完整自然日，凌晨跑也不会漏掉跨零点的会话。
+$windowStart = $dayStart.AddDays(-1)
 $startMs = [DateTimeOffset]::new($dayStart).ToUnixTimeMilliseconds()
 $endMs = [DateTimeOffset]::new($dayEnd).ToUnixTimeMilliseconds()
 $sinceArg = $dayStart.ToString('yyyy-MM-dd HH:mm:ss')
@@ -32,6 +42,12 @@ $outDir = Join-Path $ReportDir '_源数据'
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $outFile = Join-Path $outDir "$Date.md"
 
+$maxWorkspaces = 12
+$maxFilesPerWorkspace = 400
+$maxReposPerWorkspace = 12
+# 目录遍历上限：防止把整个用户目录或误配的盘符根扫穿；到顶就停，并在第 1 节注明。
+$maxDirsPerWorkspace = 20000
+
 $skipDirs = @('node_modules', '.pnpm-store', '.git', 'dist', 'build', '.next', 'target',
   'temp', 'tmp', '.cache', '__pycache__', '_源数据', '.dsh-vision-router',
   # 第三方资产/工具目录：装技能、跑示例产生的海量文件不该进日报
@@ -39,15 +55,382 @@ $skipDirs = @('node_modules', '.pnpm-store', '.git', 'dist', 'build', '.next', '
   # 临时/调试文件专区：一次性脚本与中间产物不算工作产出
   '_scratch')
 
-function Test-SkipPath([string]$rel) {
-  foreach ($seg in ($rel -split '[\\/]')) {
-    if ($skipDirs -contains $seg) { return $true }
-  }
-  return $false
+function Test-SkipName([string]$name) {
+  return ($skipDirs -contains $name)
 }
 
 $sb = [System.Collections.Generic.List[string]]::new()
 function Add-Line([string]$s = '') { $sb.Add($s) }
+
+# ---------- 工作区配置：_工作区.md ----------
+$wsConfigPath = Join-Path $ReportDir '_工作区.md'
+
+function Initialize-WorkspaceConfig {
+  if (Test-Path -LiteralPath $wsConfigPath) { return }
+  Set-Content -LiteralPath $wsConfigPath -Encoding UTF8 -Value @(
+    '# 工作区'
+    ''
+    '> 工作区由 `collect-day.ps1` 从近两天有活动的 DSH 会话自动发现，一般不用手工维护。'
+    '> 这里只放两类修正：改显示名的「别名」，和不该进日报的「忽略」目录（含其子目录）。'
+    ''
+    '## 别名'
+    ''
+    '<!-- 一行一个：- 绝对路径 = 显示名。例：'
+    '- F:\novel = 小说'
+    '-->'
+    ''
+    '## 忽略'
+    ''
+    '<!-- 一行一个：- 绝对路径。例：'
+    '- C:\Users\me\AppData\Local\Temp'
+    '-->'
+  )
+}
+
+function Get-WorkspaceConfig {
+  $cfg = @{ Aliases = @{}; Ignores = [System.Collections.Generic.List[string]]::new() }
+  if (-not (Test-Path -LiteralPath $wsConfigPath)) { return $cfg }
+  $section = ''
+  $inComment = $false
+  foreach ($line in (Get-Content -LiteralPath $wsConfigPath -Encoding UTF8)) {
+    $trimmed = $line.Trim()
+    # 跳过 <!-- … --> 块注释：模板里的示例路径不能被当成真实别名/忽略。
+    if ($inComment) {
+      if ($trimmed -match '-->') { $inComment = $false }
+      continue
+    }
+    if ($trimmed -match '^<!--') { $inComment = $true; continue }
+    if ($line -match '^##\s*(.+?)\s*$') {
+      $section = switch -Regex ($Matches[1]) {
+        '^别名' { 'alias' }
+        '^忽略' { 'ignore' }
+        default { '' }
+      }
+      continue
+    }
+    if ($section -eq 'alias' -and $line -match '^\s*-\s*(.+?)\s*=\s*(.+?)\s*$') {
+      $p = ConvertTo-NormalPath $Matches[1]
+      if ($p) { $cfg.Aliases[$p.ToLowerInvariant()] = $Matches[2] }
+    } elseif ($section -eq 'ignore' -and $line -match '^\s*-\s*(.+?)\s*$') {
+      $p = ConvertTo-NormalPath $Matches[1]
+      if ($p) { $cfg.Ignores.Add($p) }
+    }
+  }
+  return $cfg
+}
+
+function ConvertTo-NormalPath([string]$p) {
+  if (-not $p) { return $null }
+  $p = $p.Trim().Trim('"').Trim("'")
+  if (-not $p) { return $null }
+  try { $full = [IO.Path]::GetFullPath($p) } catch { return $null }
+  return $full.TrimEnd('\')
+}
+
+# junction / 符号链接解析成真实路径，最多 5 层，避免环。
+function Resolve-RealPath([string]$p) {
+  $cur = ConvertTo-NormalPath $p
+  if (-not $cur) { return $null }
+  for ($i = 0; $i -lt 5; $i++) {
+    $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+    if (-not $item) { break }
+    if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { break }
+    $target = $item.Target
+    if ($target -is [array]) { $target = $target[0] }
+    if (-not $target) { break }
+    if (-not [IO.Path]::IsPathRooted($target)) {
+      $target = Join-Path (Split-Path -Parent $cur) $target
+    }
+    $next = ConvertTo-NormalPath $target
+    if (-not $next -or $next -eq $cur) { break }
+    $cur = $next
+  }
+  return $cur
+}
+
+function Test-PathUnder([string]$path, [string]$root) {
+  if (-not $path -or -not $root) { return $false }
+  $p = $path.TrimEnd('\').ToLowerInvariant()
+  $r = $root.TrimEnd('\').ToLowerInvariant()
+  return ($p -eq $r -or $p.StartsWith($r + '\'))
+}
+
+$wsConfig = Get-WorkspaceConfig
+
+$defaultIgnores = @(
+  (Join-Path $HOME '.dsh'),
+  (Join-Path $HOME 'AppData'),
+  $ReportDir,
+  $env:TEMP,
+  $env:WINDIR,
+  ${env:ProgramFiles},
+  ${env:ProgramFiles(x86)},
+  $env:ProgramData
+) | Where-Object { $_ } | ForEach-Object { ConvertTo-NormalPath $_ } | Where-Object { $_ }
+
+# 家目录本身不扫（整个 profile 太大），但家目录下的项目照常发现；AppData 已经在 $defaultIgnores 里整棵跳过。
+$exactIgnores = @($HOME) | Where-Object { $_ } | ForEach-Object { ConvertTo-NormalPath $_ } | Where-Object { $_ }
+
+function Test-IgnoredWorkspace([string]$path) {
+  # 盘符根（F:\）不扫，递归整块盘没有意义。
+  $parent = Split-Path -Parent $path
+  if (-not $parent) { return '盘符根目录' }
+  $lower = $path.TrimEnd('\').ToLowerInvariant()
+  foreach ($root in $exactIgnores) {
+    if ($lower -eq $root.TrimEnd('\').ToLowerInvariant()) { return "忽略（$root）" }
+  }
+  foreach ($root in ($wsConfig.Ignores + $defaultIgnores)) {
+    if (Test-PathUnder $path $root) { return "忽略（$root）" }
+  }
+  return $null
+}
+
+# ---------- 会话解析 ----------
+# 近两天有活动的会话都读一遍：工作区发现与第 3 节共用这份结果，避免重复解压。
+function Read-SessionInfo($file) {
+  $zstd = (Get-Command zstd -ErrorAction SilentlyContinue).Source
+  if (-not $zstd) { $zstd = 'C:\Program Files\poppler\Library\bin\zstd.exe' }
+  $info = [pscustomobject]@{
+    File       = $file
+    DirName    = $file.Directory.Parent.Name
+    Cwd        = $null
+    Title      = $null
+    Users      = [System.Collections.Generic.List[string]]::new()
+    LastReply  = $null
+    ToolToday  = 0
+    ToolWindow = 0
+    ToolNames  = @{}
+    Today      = ($file.LastWriteTime -ge $dayStart -and $file.LastWriteTime -lt $dayEnd)
+    Error      = $null
+  }
+  if (-not (Test-Path -LiteralPath $zstd)) {
+    $info.Error = '未找到 zstd，无法解析会话'
+    $script:sessionProblems['zstd'] = $true
+    return $info
+  }
+  try {
+    $raw = & $zstd -d -c $file.FullName 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      $info.Error = "zstd 解压失败（退出码 $LASTEXITCODE）；该会话未计入"
+      $script:sessionProblems['decompress'] = 1 + [int]$script:sessionProblems['decompress']
+    }
+    foreach ($line in $raw) {
+      if (-not $line) { continue }
+      try { $o = $line | ConvertFrom-Json } catch { continue }
+      switch ($o.type) {
+        'session'       { if ($o.cwd) { $info.Cwd = $o.cwd } }
+        'session/title' { if ($o.data.title) { $info.Title = $o.data.title } }
+        'user/message' {
+          if ($o.time -ge $startMs -and $o.time -lt $endMs) {
+            $txt = ($o.data.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join ' '
+            if ($txt) {
+              $txt = ($txt -replace '\s+', ' ').Trim()
+              # 过滤注入内容与无信息量的催更
+              $injected = $txt -match '^(<system-reminder>|Current runtime context|Time sampled|\[System\]|A skill is a reusable)'
+              $filler = $txt.Length -le 4 -and $txt -match '^(继续|好的|ok|OK|嗯|你好)'
+              if (-not $injected -and -not $filler) {
+                if ($txt.Length -gt 110) { $txt = $txt.Substring(0, 110) + '…' }
+                if ($info.Users.Count -eq 0 -or $info.Users[-1] -ne $txt) { $info.Users.Add($txt) }
+              }
+            }
+          }
+        }
+        'assistant/message' {
+          if ($o.time -ge $startMs -and $o.time -lt $endMs) {
+            $r = ($o.data.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join ' '
+            if ($r) {
+              $r = ($r -replace '\s+', ' ').Trim()
+              if ($r.Length -gt 220) { $r = $r.Substring(0, 220) + '…' }
+              $info.LastReply = $r
+            }
+          }
+        }
+        'tool/call' {
+          if ($o.time -ge $startMs -and $o.time -lt $endMs) {
+            $info.ToolToday++
+            if ($o.data.name) { $info.ToolNames[$o.data.name] = 1 + [int]$info.ToolNames[$o.data.name] }
+          }
+          if ($o.time -ge [DateTimeOffset]::new($windowStart).ToUnixTimeMilliseconds() -and $o.time -lt $endMs) {
+            $info.ToolWindow++
+          }
+        }
+      }
+    }
+  } catch {
+    $info.Error = $_.Exception.Message
+  }
+  return $info
+}
+
+$sessionProblems = @{ zstd = $false; decompress = 0 }
+$sessionInfos = @()
+$sessRoot = Join-Path $DshHome 'sessions'
+if (-not $NoSessions -and (Test-Path $sessRoot)) {
+  $sessFiles = @(Get-ChildItem -Path $sessRoot -Recurse -File -Filter 'session.v4.jsonl.zstd' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -ge $windowStart -and $_.LastWriteTime -lt $dayEnd } |
+    Sort-Object LastWriteTime)
+  foreach ($sf in $sessFiles) { $sessionInfos += (Read-SessionInfo $sf) }
+}
+
+# ---------- 工作区列表 ----------
+$workspaces = [System.Collections.Generic.List[object]]::new()
+$seen = @{}
+$skipped = [System.Collections.Generic.List[object]]::new()
+
+function Add-Workspace([string]$rawPath, [string]$source) {
+  $real = Resolve-RealPath $rawPath
+  if (-not $real -or -not (Test-Path -LiteralPath $real -PathType Container)) {
+    $skipped.Add([pscustomobject]@{ Path = $rawPath; Reason = '目录不存在' })
+    return $null
+  }
+  # 盘符根整块扫没有意义，显式指定也不放行（否则一次采集可能跑几十分钟）。
+  if (-not (Split-Path -Parent $real)) {
+    $skipped.Add([pscustomobject]@{ Path = $real; Reason = '盘符根目录' })
+    return $null
+  }
+  if ($seen.ContainsKey($real.ToLowerInvariant())) {
+    $existing = $workspaces | Where-Object { $_.RealPath.ToLowerInvariant() -eq $real.ToLowerInvariant() } | Select-Object -First 1
+    if ($existing -and $source -eq '会话' -and -not $existing.FromSession) { $existing.FromSession = $true }
+    return $existing
+  }
+  # 显式指定的根是用户意图，不再套默认忽略规则；自动发现的才过滤。
+  $reason = if ($source -eq '指定') { $null } else { Test-IgnoredWorkspace $real }
+  if ($reason) {
+    $skipped.Add([pscustomobject]@{ Path = $real; Reason = $reason })
+    return $null
+  }
+  $alias = $wsConfig.Aliases[$real.ToLowerInvariant()]
+  $name = if ($alias) { $alias } else { Split-Path -Leaf $real }
+  $ws = [pscustomobject]@{
+    Name        = $name
+    RealPath    = $real
+    FromSession = ($source -eq '会话')
+    Explicit    = ($source -eq '指定')
+    Sessions    = 0
+    ToolWindow  = 0
+    Files       = @()
+    FileTotal   = 0
+    Truncated   = $false
+    ScanStopped = $false
+    Repos       = @()
+    RepoTotal   = 0
+  }
+  $seen[$real.ToLowerInvariant()] = $true
+  $workspaces.Add($ws)
+  return $ws
+}
+
+foreach ($info in $sessionInfos) {
+  if (-not $info.Cwd) { continue }
+  $ws = Add-Workspace $info.Cwd '会话'
+  if ($ws) {
+    $ws.Sessions++
+    $ws.ToolWindow += $info.ToolWindow
+  }
+}
+
+$explicitWs = $null
+if ($Workspace) {
+  $explicitWs = Add-Workspace $Workspace '指定'
+}
+
+# 一个工作区都没发现时退回旧行为，至少把调用方指定的根扫了。
+if ($workspaces.Count -eq 0) {
+  $fallback = if ($Workspace) { $Workspace } else { Join-Path $DshHome 'dsh-work-summary' }
+  $explicitWs = Add-Workspace $fallback '指定'
+  $fallbackNote = '未从会话发现工作区，退回指定根。'
+} else {
+  $fallbackNote = $null
+}
+
+# 排序：会话多、工具调用多的在前；显式指定的根始终保留在列表里。
+$allCount = $workspaces.Count
+$workspaces = @($workspaces | Sort-Object @{ Expression = { if ($_.Explicit) { 0 } else { 1 } } },
+  @{ Expression = 'Sessions'; Descending = $true },
+  @{ Expression = 'ToolWindow'; Descending = $true },
+  @{ Expression = 'Name' })
+if ($workspaces.Count -gt $maxWorkspaces) {
+  $workspaces = @($workspaces | Select-Object -First $maxWorkspaces)
+}
+
+# 同名工作区用父目录区分，避免两个 docs 混淆。
+$nameCount = @{}
+foreach ($ws in $workspaces) { $nameCount[$ws.Name] = 1 + [int]$nameCount[$ws.Name] }
+foreach ($ws in $workspaces) {
+  if ($nameCount[$ws.Name] -gt 1) {
+    $ws.Name = '{0}\{1}' -f (Split-Path -Leaf (Split-Path -Parent $ws.RealPath)), $ws.Name
+  }
+}
+
+# 每个工作区：改动文件（广度优先，跳过 skipDirs 与链接目录）与 Git 仓库。
+# 父子工作区同时出现时（比如 F:\dsh_plugins 与 F:\dsh_plugins\dsh-work-summary），
+# 父区扫描要跳过子区，否则同一批文件与提交会被统计两遍。
+foreach ($ws in $workspaces) {
+  $children = @($workspaces | Where-Object { $_ -ne $ws -and (Test-PathUnder $_.RealPath $ws.RealPath) } |
+    ForEach-Object { $_.RealPath.ToLowerInvariant() })
+  $ws | Add-Member -NotePropertyName ChildRoots -NotePropertyValue $children -Force
+}
+
+function Test-ChildRoot([string]$path, $childRoots) {
+  if (-not $childRoots -or $childRoots.Count -eq 0) { return $false }
+  $p = $path.TrimEnd('\').ToLowerInvariant()
+  return ($childRoots -contains $p)
+}
+
+function Get-WorkspaceFiles($ws) {
+  $found = [System.Collections.Generic.List[object]]::new()
+  $total = 0
+  $queue = [System.Collections.Generic.Queue[object]]::new()
+  $queue.Enqueue($ws.RealPath)
+  $dirCount = 0
+  while ($queue.Count -gt 0) {
+    if ($dirCount -ge $maxDirsPerWorkspace) { $ws.ScanStopped = $true; break }
+    $dirCount++
+    $dir = $queue.Dequeue()
+    $entries = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)
+    foreach ($e in $entries) {
+      if ($e.PSIsContainer) {
+        if (Test-SkipName $e.Name) { continue }
+        if (Test-ChildRoot $e.FullName $ws.ChildRoots) { continue }
+        if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        $queue.Enqueue($e.FullName)
+        continue
+      }
+      if ($e.LastWriteTime -lt $dayStart -or $e.LastWriteTime -ge $dayEnd) { continue }
+      $rel = $e.FullName.Substring($ws.RealPath.Length).TrimStart('\')
+      if (-not $rel) { continue }
+      $total++
+      if ($found.Count -lt $maxFilesPerWorkspace) { $found.Add([pscustomobject]@{ File = $e; Rel = $rel }) }
+    }
+  }
+  $ws.FileTotal = $total
+  $ws.Truncated = ($total -gt $maxFilesPerWorkspace)
+  $ws.Files = @($found | Sort-Object { $_.File.LastWriteTime })
+}
+
+function Get-WorkspaceRepos($ws) {
+  $repos = [System.Collections.Generic.List[string]]::new()
+  $queue = [System.Collections.Generic.Queue[object]]::new()
+  $queue.Enqueue([pscustomobject]@{ Path = $ws.RealPath; Depth = 0 })
+  while ($queue.Count -gt 0 -and $repos.Count -lt $maxReposPerWorkspace) {
+    $node = $queue.Dequeue()
+    if (Test-Path -LiteralPath (Join-Path $node.Path '.git')) { $repos.Add($node.Path) }
+    if ($node.Depth -ge 2) { continue }
+    foreach ($d in @(Get-ChildItem -LiteralPath $node.Path -Directory -Force -ErrorAction SilentlyContinue)) {
+      if (Test-SkipName $d.Name) { continue }
+      if (Test-ChildRoot $d.FullName $ws.ChildRoots) { continue }
+      if ($d.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+      $queue.Enqueue([pscustomobject]@{ Path = $d.FullName; Depth = $node.Depth + 1 })
+    }
+  }
+  $ws.Repos = @($repos)
+  $ws.RepoTotal = $repos.Count
+}
+
+foreach ($ws in $workspaces) {
+  Get-WorkspaceFiles $ws
+  Get-WorkspaceRepos $ws
+}
 
 # ---------- 源数据归档 ----------
 # `_源数据` 只保留最近 60 个 Markdown；更旧的按数据日期分季度压进 `_归档\YYYY-QN.zip`。
@@ -135,45 +518,78 @@ function Invoke-SourceArchive {
   return $notes.ToArray()
 }
 
+# 首次运行生成 _工作区.md，让忽略与别名有地方写。
+Initialize-WorkspaceConfig
+
 Add-Line "# 工作痕迹源数据 · $Date"
 Add-Line ''
 Add-Line "> 采集窗口：$sinceArg ~ $untilArg（本地时区 $([DateTime]::Now.ToString('zzz'))）"
 Add-Line '> 本文件由 `collect-day.ps1` 只读生成，用于日报的事实依据；不要手工编辑。'
 Add-Line ''
 
+# ---------- 0. 工作区（近两天活跃） ----------
+Add-Line '## 0. 工作区（近两天活跃）'
+Add-Line ''
+if ($workspaces.Count -eq 0) {
+  Add-Line '_未发现工作区：近两天没有带工作目录的 DSH 会话，也没有传入 -Workspace。_'
+} else {
+  Add-Line "共 $($workspaces.Count) 个工作区（窗口 $($windowStart.ToString('yyyy-MM-dd')) ~ $Date，按会话活跃度排序）。"
+  if ($allCount -gt $workspaces.Count) { Add-Line "> 另有 $($allCount - $workspaces.Count) 个未列出（上限 $maxWorkspaces）。" }
+  if ($fallbackNote) { Add-Line "> $fallbackNote" }
+  if ($sessionProblems['zstd']) { Add-Line '> 警告：未找到 zstd，无法从 DSH 会话发现工作区（只扫指定根）。' }
+  if ($sessionProblems['decompress'] -gt 0) { Add-Line "> 警告：$($sessionProblems['decompress']) 个会话解压失败，工作区可能漏列（见第 3 节）。" }
+  Add-Line ''
+  Add-Line '| 工作区 | 路径 | 近两天会话 | 近两天工具调用 | 当日改动文件 |'
+  Add-Line '|---|---|---:|---:|---:|'
+  foreach ($ws in $workspaces) {
+    $filesCell = if ($ws.Truncated) { "$($ws.FileTotal)（截断）" } else { "$($ws.FileTotal)" }
+    Add-Line ("| {0} | ``{1}`` | {2} | {3} | {4} |" -f $ws.Name, $ws.RealPath, $ws.Sessions, $ws.ToolWindow, $filesCell)
+  }
+  if ($skipped.Count -gt 0) {
+    Add-Line ''
+    Add-Line "> 已跳过 $($skipped.Count) 个目录：" + (($skipped | Select-Object -First 6 | ForEach-Object { "``$($_.Path)``（$($_.Reason)）" }) -join '、')
+  }
+}
+Add-Line ''
+
 # ---------- 1. 工作区文件改动 ----------
 Add-Line '## 1. 工作区当日改动文件'
 Add-Line ''
-$files = @()
-if (Test-Path $Workspace) {
-  $files = Get-ChildItem -Path $Workspace -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.LastWriteTime -ge $dayStart -and $_.LastWriteTime -lt $dayEnd -and
-      -not (Test-SkipPath $_.FullName.Substring($Workspace.Length))
-    } | Sort-Object LastWriteTime
-}
-
-if ($files.Count -eq 0) {
+$totalFiles = ($workspaces | ForEach-Object { $_.FileTotal } | Measure-Object -Sum).Sum
+if (-not $totalFiles) {
   Add-Line '_当日无文件改动。_'
 } else {
-  Add-Line "共 $($files.Count) 个文件："
-  Add-Line ''
-  Add-Line '| 时间 | 大小 | 相对路径 |'
-  Add-Line '|------|------|----------|'
-  foreach ($f in $files) {
-    $rel = $f.FullName.Substring($Workspace.Length).TrimStart('\')
-    $size = if ($f.Length -ge 1MB) { '{0:N1} MB' -f ($f.Length / 1MB) }
-            elseif ($f.Length -ge 1KB) { '{0:N1} KB' -f ($f.Length / 1KB) }
-            else { "$($f.Length) B" }
-    Add-Line ("| {0:HH:mm} | {1} | {2} |" -f $f.LastWriteTime, $size, $rel)
-  }
+  foreach ($ws in $workspaces) {
+    if ($ws.FileTotal -eq 0) { continue }
+    Add-Line ("### {0}（``{1}``）" -f $ws.Name, $ws.RealPath)
+    Add-Line ''
+    if ($ws.Truncated) {
+      Add-Line "共 $($ws.FileTotal) 个文件，仅列前 $maxFilesPerWorkspace 个："
+    } else {
+      Add-Line "共 $($ws.FileTotal) 个文件："
+    }
+    if ($ws.ScanStopped) {
+      Add-Line "> 目录数超过 $maxDirsPerWorkspace 个，已停止遍历；以下统计可能不完整。"
+    }
+    Add-Line ''
+    Add-Line '| 时间 | 大小 | 相对路径 |'
+    Add-Line '|------|------|----------|'
+    foreach ($entry in $ws.Files) {
+      $f = $entry.File
+      $size = if ($f.Length -ge 1MB) { '{0:N1} MB' -f ($f.Length / 1MB) }
+              elseif ($f.Length -ge 1KB) { '{0:N1} KB' -f ($f.Length / 1KB) }
+              else { "$($f.Length) B" }
+      Add-Line ("| {0:HH:mm} | {1} | {2} |" -f $f.LastWriteTime, $size, $entry.Rel)
+    }
 
-  Add-Line ''
-  Add-Line '### 按顶层目录汇总'
-  Add-Line ''
-  $files | Group-Object { ($_.FullName.Substring($Workspace.Length).TrimStart('\') -split '[\\/]')[0] } |
-    Sort-Object Count -Descending |
-    ForEach-Object { Add-Line ("- ``{0}``：{1} 个文件" -f $_.Name, $_.Count) }
+    Add-Line ''
+    Add-Line '按顶层目录汇总：'
+    Add-Line ''
+    foreach ($g in ($ws.Files | Group-Object { ($_.Rel -split '[\\/]')[0] } | Sort-Object Count -Descending | Select-Object -First 12)) {
+      Add-Line ("- ``{0}``：{1} 个文件" -f $g.Name, $g.Count)
+    }
+    Add-Line ''
+  }
 }
 Add-Line ''
 
@@ -181,36 +597,32 @@ Add-Line ''
 Add-Line '## 2. Git 仓库当日提交'
 Add-Line ''
 $gitExe = (Get-Command git -ErrorAction SilentlyContinue).Source
-$repos = @()
-if ($gitExe -and (Test-Path $Workspace)) {
-  $repos = Get-ChildItem -Path $Workspace -Directory -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue |
-    Where-Object { Test-Path (Join-Path $_.FullName '.git') } |
-    Select-Object -ExpandProperty FullName
-}
-
 if (-not $gitExe) {
   Add-Line '_未找到 git，跳过。_'
-} elseif ($repos.Count -eq 0) {
-  Add-Line '_工作区内未发现 Git 仓库。_'
 } else {
-  $anyCommit = $false
-  foreach ($repo in $repos) {
-    $rel = if ($repo -eq $Workspace) { '.' } else { $repo.Substring($Workspace.Length).TrimStart('\') }
-    $log = & $gitExe -C $repo log --since="$sinceArg" --until="$untilArg" --pretty='%h %ad %s' --date=format:'%H:%M' --no-decorate 2>$null
-    $branch = (& $gitExe -C $repo rev-parse --abbrev-ref HEAD 2>$null)
-    $dirty = @(& $gitExe -C $repo status --porcelain 2>$null).Count
-    if ($log) {
-      $anyCommit = $true
-      Add-Line "### ``$rel`` （分支 $branch）"
-      Add-Line ''
-      foreach ($l in $log) { Add-Line "- $l" }
-      Add-Line ''
-      if ($dirty -gt 0) { Add-Line "- 另有 $dirty 个未提交改动" ; Add-Line '' }
-    } elseif ($dirty -gt 0) {
-      Add-Line "- ``$rel``：当日无提交，但有 $dirty 个未提交改动（分支 $branch）"
+  $anyRepo = $false
+  foreach ($ws in $workspaces) {
+    if ($ws.Repos.Count -eq 0) { continue }
+    $anyRepo = $true
+    Add-Line ("### {0}（``{1}``）" -f $ws.Name, $ws.RealPath)
+    Add-Line ''
+    foreach ($repo in $ws.Repos) {
+      $rel = if ($repo -eq $ws.RealPath) { '.' } else { $repo.Substring($ws.RealPath.Length).TrimStart('\') }
+      $log = & $gitExe -C $repo log --since="$sinceArg" --until="$untilArg" --pretty='%h %ad %s' --date=format:'%H:%M' --no-decorate 2>$null
+      $branch = (& $gitExe -C $repo rev-parse --abbrev-ref HEAD 2>$null)
+      $dirty = @(& $gitExe -C $repo status --porcelain 2>$null).Count
+      if ($log) {
+        Add-Line "#### ``$rel`` （分支 $branch）"
+        Add-Line ''
+        foreach ($l in $log) { Add-Line "- $l" }
+        Add-Line ''
+        if ($dirty -gt 0) { Add-Line "- 另有 $dirty 个未提交改动" ; Add-Line '' }
+      } elseif ($dirty -gt 0) {
+        Add-Line "- ``$rel``：当日无提交，但有 $dirty 个未提交改动（分支 $branch）"
+      }
     }
   }
-  if (-not $anyCommit) { Add-Line '' }
+  if (-not $anyRepo) { Add-Line '_工作区内未发现 Git 仓库。_' }
 }
 Add-Line ''
 
@@ -220,85 +632,36 @@ Add-Line ''
 if ($NoSessions) {
   Add-Line '_（-NoSessions 跳过）_'
 } else {
-  $sessRoot = Join-Path $DshHome 'sessions'
-  $zstd = (Get-Command zstd -ErrorAction SilentlyContinue).Source
-  if (-not $zstd) { $zstd = 'C:\Program Files\poppler\Library\bin\zstd.exe' }
-
-  $sessFiles = @()
-  if (Test-Path $sessRoot) {
-    $sessFiles = Get-ChildItem -Path $sessRoot -Recurse -File -Filter 'session.v4.jsonl.zstd' -ErrorAction SilentlyContinue |
-      Where-Object { $_.LastWriteTime -ge $dayStart -and $_.LastWriteTime -lt $dayEnd } |
-      Sort-Object LastWriteTime
-  }
-
-  if ($sessFiles.Count -eq 0) {
+  $todaySessions = @($sessionInfos | Where-Object { $_.Today })
+  if ($todaySessions.Count -eq 0) {
     Add-Line '_当日无 DSH 会话活动。_'
   } else {
-    Add-Line "共 $($sessFiles.Count) 个会话有活动。"
+    Add-Line "共 $($todaySessions.Count) 个会话有活动。"
     Add-Line ''
-    foreach ($sf in $sessFiles) {
-      $wsName = $sf.Directory.Parent.Name
-      $title = $null; $cwd = $null; $users = @(); $toolCount = 0
-      $toolNames = @{}; $lastReply = $null
-      if (Test-Path $zstd) {
-        try {
-          $raw = & $zstd -d -c $sf.FullName 2>$null
-          foreach ($line in $raw) {
-            if (-not $line) { continue }
-            try { $o = $line | ConvertFrom-Json } catch { continue }
-            switch ($o.type) {
-              'session'       { if ($o.cwd) { $cwd = $o.cwd } }
-              'session/title' { if ($o.data.title) { $title = $o.data.title } }
-              'user/message' {
-                if ($o.time -ge $startMs -and $o.time -lt $endMs) {
-                  $txt = ($o.data.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join ' '
-                  if ($txt) {
-                    $txt = ($txt -replace '\s+', ' ').Trim()
-                    # 过滤注入内容与无信息量的催更
-                    $injected = $txt -match '^(<system-reminder>|Current runtime context|Time sampled|\[System\]|A skill is a reusable)'
-                    $filler = $txt.Length -le 4 -and $txt -match '^(继续|好的|ok|OK|嗯|你好)'
-                    if (-not $injected -and -not $filler) {
-                      if ($txt.Length -gt 110) { $txt = $txt.Substring(0, 110) + '…' }
-                      if ($users.Count -eq 0 -or $users[-1] -ne $txt) { $users += $txt }
-                    }
-                  }
-                }
-              }
-              'assistant/message' {
-                if ($o.time -ge $startMs -and $o.time -lt $endMs) {
-                  $r = ($o.data.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join ' '
-                  if ($r) {
-                    $r = ($r -replace '\s+', ' ').Trim()
-                    if ($r.Length -gt 220) { $r = $r.Substring(0, 220) + '…' }
-                    $lastReply = $r
-                  }
-                }
-              }
-              'tool/call' {
-                if ($o.time -ge $startMs -and $o.time -lt $endMs) {
-                  $toolCount++
-                  if ($o.data.name) { $toolNames[$o.data.name] = 1 + [int]$toolNames[$o.data.name] }
-                }
-              }
-            }
-          }
-        } catch { Add-Line ("- ``{0}`` 解析失败：{1}" -f $wsName, $_.Exception.Message) }
+    foreach ($info in $todaySessions) {
+      $wsName = $null
+      if ($info.Cwd) {
+        $realCwd = Resolve-RealPath $info.Cwd
+        $match = $workspaces | Where-Object { $realCwd -and (Test-PathUnder $realCwd $_.RealPath) } |
+          Sort-Object { $_.RealPath.Length } -Descending | Select-Object -First 1
+        if ($match) { $wsName = $match.Name }
       }
-
-      Add-Line ("### ``{0}``" -f $wsName)
+      Add-Line ("### ``{0}``" -f $info.DirName)
       Add-Line ''
-      Add-Line ("- 会话目录：``{0}``" -f $sf.FullName)
-      if ($cwd) { Add-Line ("- 工作目录：``{0}``" -f $cwd) }
-      if ($title) { Add-Line ("- 标题：{0}" -f $title) }
-      Add-Line ("- 当日有效用户消息 {0} 条，工具调用 {1} 次" -f $users.Count, $toolCount)
-      if ($toolNames.Count -gt 0) {
-        $top = ($toolNames.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 6 |
+      Add-Line ("- 会话目录：``{0}``" -f $info.File.FullName)
+      if ($info.Cwd) { Add-Line ("- 工作目录：``{0}``" -f $info.Cwd) }
+      if ($wsName) { Add-Line ("- 所属工作区：{0}" -f $wsName) }
+      if ($info.Title) { Add-Line ("- 标题：{0}" -f $info.Title) }
+      if ($info.Error) { Add-Line ("- 解析失败：{0}" -f $info.Error) }
+      Add-Line ("- 当日有效用户消息 {0} 条，工具调用 {1} 次" -f $info.Users.Count, $info.ToolToday)
+      if ($info.ToolNames.Count -gt 0) {
+        $top = ($info.ToolNames.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 6 |
           ForEach-Object { '{0}×{1}' -f $_.Key, $_.Value }) -join '、'
         Add-Line ("- 工具分布：{0}" -f $top)
       }
-      if ($lastReply) { Add-Line ("- 最后一条回复：{0}" -f $lastReply) }
-      foreach ($u in ($users | Select-Object -First 12)) { Add-Line ("  - 「{0}」" -f $u) }
-      if ($users.Count -gt 12) { Add-Line ("  - …另有 {0} 条" -f ($users.Count - 12)) }
+      if ($info.LastReply) { Add-Line ("- 最后一条回复：{0}" -f $info.LastReply) }
+      foreach ($u in ($info.Users | Select-Object -First 12)) { Add-Line ("  - 「{0}」" -f $u) }
+      if ($info.Users.Count -gt 12) { Add-Line ("  - …另有 {0} 条" -f ($info.Users.Count - 12)) }
       Add-Line ''
     }
   }
@@ -340,16 +703,23 @@ Add-Line ''
 # ---------- 5. 当日已有产物 ----------
 Add-Line '## 5. 已知产物目录'
 Add-Line ''
-foreach ($d in @('_报告源文件', '_巡检', '_日报', '_协作规范')) {
-  $p = Join-Path $Workspace $d
-  if (Test-Path $p) {
-    $recent = Get-ChildItem $p -File -Recurse -Force -ErrorAction SilentlyContinue |
-      Where-Object { $_.LastWriteTime -ge $dayStart -and $_.LastWriteTime -lt $dayEnd }
-    if ($recent) {
-      foreach ($r in $recent) { Add-Line ("- ``{0}``（{1:HH:mm}）" -f $r.FullName, $r.LastWriteTime) }
-    }
+$productDirs = @('_报告源文件', '_巡检', '_日报', '_协作规范')
+$anyProduct = $false
+foreach ($ws in $workspaces) {
+  foreach ($d in $productDirs) {
+    $p = Join-Path $ws.RealPath $d
+    if (-not (Test-Path $p)) { continue }
+    $recent = @(Get-ChildItem $p -File -Recurse -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -ge $dayStart -and $_.LastWriteTime -lt $dayEnd })
+    if ($recent.Count -eq 0) { continue }
+    $anyProduct = $true
+    Add-Line ("### {0} · ``{1}``" -f $ws.Name, $d)
+    Add-Line ''
+    foreach ($r in $recent) { Add-Line ("- ``{0}``（{1:HH:mm}）" -f $r.FullName, $r.LastWriteTime) }
+    Add-Line ''
   }
 }
+if (-not $anyProduct) { Add-Line '_当日无已知产物目录更新。_' }
 Add-Line ''
 
 # ---------- 6. 源数据归档 ----------
@@ -360,6 +730,54 @@ if ($archiveNotes.Count -gt 0) {
   foreach ($note in $archiveNotes) { Add-Line $note }
   Add-Line ''
 }
+
+# ---------- 7. 未清主线（_主线.md 账本） ----------
+Add-Line '## 7. 未清主线（`_主线.md`）'
+Add-Line ''
+$ledgerPath = Join-Path $ReportDir '_主线.md'
+if (-not (Test-Path $ledgerPath)) {
+  Add-Line '_暂无主线账本：第一份含 `#### M-YYYY-MM-DD-NN` 小节的日报落盘后会生成。_'
+} else {
+  $entries = @()
+  $cur = $null
+  foreach ($line in (Get-Content $ledgerPath -Encoding UTF8)) {
+    if ($line -match '^##\s+(M-\d{4}-\d{2}-\d{2}-\d{2})\s*(.*)$') {
+      $cur = [pscustomobject]@{
+        Id = $Matches[1]; Title = $Matches[2].Trim(); Workspace = ''; Status = '进行中'; Last = ''
+      }
+      $entries += $cur
+      continue
+    }
+    if (-not $cur) { continue }
+    if ($line -match '^-\s*工作区：\s*(.+)$') { $cur.Workspace = $Matches[1].Trim() }
+    elseif ($line -match '^-\s*状态：\s*(.+)$') { $cur.Status = $Matches[1].Trim() }
+    elseif ($line -match '^-\s*最近产出：\s*(.+)$') { $cur.Last = $Matches[1].Trim() }
+  }
+  $openEntries = @($entries | Where-Object { $_.Status -ne '完成' -and $_.Status -ne '放弃' })
+  if ($openEntries.Count -eq 0) {
+    Add-Line '_没有未完成的主线。_'
+  } else {
+    Add-Line '| 主线 | 标题 | 工作区 | 状态 | 最近产出 | 挂起天数 |'
+    Add-Line '|---|---|---|---|---|---|'
+    foreach ($e in $openEntries) {
+      $days = 0
+      if ($e.Last -match '^\d{4}-\d{2}-\d{2}$') {
+        try {
+          $days = [int][math]::Floor(($day - [datetime]::ParseExact($e.Last, 'yyyy-MM-dd', $null)).TotalDays)
+        } catch { $days = 0 }
+        if ($days -lt 0) { $days = 0 }
+      }
+      $status = $e.Status
+      if ($days -ge $StallDays) { $status = '受阻' }
+      $ws = if ($e.Workspace) { $e.Workspace } else { '—' }
+      $last = if ($e.Last) { $e.Last } else { '—' }
+      Add-Line ("| {0} | {1} | {2} | {3} | {4} | {5} |" -f $e.Id, $e.Title, $ws, $status, $last, $days)
+    }
+    Add-Line ''
+    Add-Line ("受阻判定：未完成、未放弃，且最近产出距今 ≥ {0} 天（mainline.stallDays）。" -f $StallDays)
+  }
+}
+Add-Line ''
 
 Set-Content -Path $outFile -Value $sb -Encoding UTF8
 Write-Output $outFile

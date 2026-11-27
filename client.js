@@ -71,7 +71,30 @@ window.__ModuleLoader__.load({
       heading: { fontWeight: 600, margin: '18px 0 6px' },
       para: { margin: '4px 0' },
       bullet: { margin: '3px 0', paddingLeft: 4 },
-      table: { fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace', fontSize: 12.5, whiteSpace: 'pre-wrap' },
+      tableWrap: { margin: '8px 0 12px', overflowX: 'auto' },
+      table: { borderCollapse: 'collapse', borderSpacing: 0, width: '100%', fontSize: 13, lineHeight: 1.55 },
+      th: {
+        padding: '5px 10px', borderBottom: '1px solid rgba(127,127,127,.38)',
+        background: 'rgba(127,127,127,.1)', fontWeight: 600, whiteSpace: 'nowrap',
+      },
+      td: { padding: '5px 10px', borderBottom: '1px solid rgba(127,127,127,.16)', verticalAlign: 'top' },
+      tableRaw: { fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace', fontSize: 12.5, whiteSpace: 'pre-wrap' },
+      summaryPanel: {
+        margin: '0 0 16px', border: '1px solid rgba(127,127,127,.22)', borderRadius: 10, padding: '12px 14px',
+      },
+      summaryHead: { display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap', marginBottom: 6 },
+      summaryTitle: { fontSize: 15, fontWeight: 600 },
+      summaryTable: { borderCollapse: 'collapse', width: '100%', fontSize: 12.5, lineHeight: 1.5 },
+      summaryTh: {
+        padding: '4px 8px', textAlign: 'left', fontWeight: 600, opacity: 0.68, whiteSpace: 'nowrap',
+        borderBottom: '1px solid rgba(127,127,127,.3)',
+      },
+      summaryTd: { padding: '4px 8px', borderBottom: '1px solid rgba(127,127,127,.12)', verticalAlign: 'top' },
+      statusChip: (status) => ({
+        display: 'inline-block', padding: '0 6px', borderRadius: 5, fontSize: 11, lineHeight: '18px', whiteSpace: 'nowrap',
+        color: status === '受阻' ? '#d14343' : status === '完成' ? '#2f9e44' : status === '放弃' ? 'inherit' : '#1971c2',
+        background: status === '受阻' ? 'rgba(209,67,67,.12)' : status === '完成' ? 'rgba(47,158,68,.12)' : 'rgba(127,127,127,.14)',
+      }),
       code: { fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace', fontSize: 12.5, background: 'rgba(127,127,127,.14)', padding: '1px 4px', borderRadius: 4 },
       quote: { margin: '6px 0', paddingLeft: 10, borderLeft: '3px solid rgba(127,127,127,.3)', opacity: 0.8 },
       hr: { border: 'none', borderTop: '1px solid rgba(127,127,127,.24)', margin: '14px 0' },
@@ -248,6 +271,107 @@ window.__ModuleLoader__.load({
       return out.length === 0 ? text : out
     }
 
+    // 拆一行表格：去掉首尾竖线，`\|` 按字面竖线处理，单元格去空白。
+    function splitRow(line) {
+      const text = String(line).trim().replace(/^\|/, '').replace(/\|$/, '')
+      const cells = []
+      let cell = ''
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i]
+        if (ch === '\\' && text[i + 1] === '|') {
+          cell += '|'
+          i += 1
+          continue
+        }
+        if (ch === '|') {
+          cells.push(cell.trim())
+          cell = ''
+          continue
+        }
+        cell += ch
+      }
+      cells.push(cell.trim())
+      return cells
+    }
+
+    // 分隔行：|---|:--:|---，每格只允许冒号与短横，且必须带竖线（`---` 是分隔线不是表格）。
+    function isTableSeparator(line) {
+      const text = String(line).trim()
+      if (!text.includes('-') || !text.includes('|')) return false
+      return splitRow(text).every(cell => /^:?-{1,}:?$/.test(cell))
+    }
+
+    // 可能的表格行：以竖线开头 / 结尾，或含分隔竖线的多列文本；否则返回 null。
+    function tableRowCells(line) {
+      const text = String(line).trim()
+      if (!text.includes('|')) return null
+      const cells = splitRow(text)
+      if (cells.length >= 2) return cells
+      return text.startsWith('|') || text.endsWith('|') ? cells : null
+    }
+
+    // `:--` 左对齐、`--:` 右对齐、`:-:` 居中；默认左对齐。
+    function columnAligns(separator) {
+      return splitRow(separator).map(cell => {
+        const left = cell.startsWith(':')
+        const right = cell.endsWith(':')
+        return left && right ? 'center' : right ? 'right' : 'left'
+      })
+    }
+
+    // 按表头列数裁剪：多出的格子丢弃，缺少的补空，避免行与列错位。
+    function tableCells(row, count) {
+      const cells = row.slice(0, count)
+      while (cells.length < count) cells.push('')
+      return cells
+    }
+
+    function renderTable(rows, aligns, key) {
+      const count = Math.max(aligns.length, 1)
+      const head = tableCells(rows[0] || [], count)
+      const body = rows.slice(1).map(row => tableCells(row, count))
+      return h('div', { key, style: S.tableWrap },
+        h('table', { style: S.table },
+          h('thead', null, h('tr', null, head.map((cell, index) => h('th', {
+            key: index,
+            style: { ...S.th, textAlign: aligns[index] || 'left' },
+          }, inline(cell))))),
+          body.length > 0
+            ? h('tbody', null, body.map((row, rowIndex) => h('tr', { key: rowIndex }, row.map((cell, index) => h('td', {
+              key: index,
+              style: { ...S.td, textAlign: aligns[index] || 'left' },
+            }, inline(cell))))))
+            : null,
+        ),
+      )
+    }
+
+    // 正文渲染：表头 + 分隔行 + 连续表格行合成真正的表格，其余逐行按原规则渲染。
+    function renderMarkdown(text) {
+      const lines = String(text ?? '').split(/\r?\n/)
+      const out = []
+      let index = 0
+      while (index < lines.length) {
+        const head = tableRowCells(lines[index])
+        if (head && index + 1 < lines.length && isTableSeparator(lines[index + 1])) {
+          const aligns = columnAligns(lines[index + 1])
+          const rows = [head]
+          index += 2
+          while (index < lines.length) {
+            const cells = tableRowCells(lines[index])
+            if (!cells || isTableSeparator(lines[index])) break
+            rows.push(cells)
+            index += 1
+          }
+          out.push(renderTable(rows, aligns, `table${index}`))
+          continue
+        }
+        out.push(renderLine(lines[index], index))
+        index += 1
+      }
+      return out
+    }
+
     function renderLine(line, index) {
       const text = line.replace(/\s+$/, '')
       const trimmed = text.trim()
@@ -265,7 +389,7 @@ window.__ModuleLoader__.load({
       if ((match = /^(\d+)[.、]\s+(.*)$/.exec(trimmed))) {
         return h('div', { key: index, style: S.bullet }, `${match[1]}. `, inline(match[2]))
       }
-      if (trimmed.startsWith('|')) return h('div', { key: index, style: S.table }, text)
+      if (trimmed.startsWith('|')) return h('div', { key: index, style: S.tableRaw }, text)
       if (trimmed.startsWith('>')) return h('div', { key: index, style: S.quote }, inline(trimmed.replace(/^>\s?/, '')))
       return h('div', { key: index, style: S.para }, inline(trimmed))
     }
@@ -491,6 +615,53 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** 工作区路径取末级目录做短标签，完整路径放在 title 里。 */
+    function workspaceLeaf(path) {
+      const text = String(path || '').replace(/[\\/]+$/, '')
+      const parts = text.split(/[\\/]/)
+      return parts[parts.length - 1] || text || '（未标注）'
+    }
+
+    /** 日报页顶部的主线面板：只读 `_主线.md` 账本，先列未清，受阻排前面。 */
+    function MainlinePanel({ mainlines, today }) {
+      const all = mainlines || []
+      const open = all.filter(item => item.status !== '完成' && item.status !== '放弃')
+      if (all.length === 0) {
+        return h('div', { style: S.summaryPanel },
+          h('div', { style: S.summaryHead }, h('span', { style: S.summaryTitle }, '主线')),
+          h('div', { style: S.muted },
+            '还没有主线记录：日报里用 #### M-YYYY-MM-DD-NN 标题 标记后，保存时会自动记到 _主线.md。'),
+        )
+      }
+      const rank = { 受阻: 0, 进行中: 1, 完成: 2, 放弃: 3 }
+      const rows = open.slice().sort((a, b) => {
+        const byStatus = (rank[a.status] ?? 9) - (rank[b.status] ?? 9)
+        return byStatus !== 0 ? byStatus : String(b.lastOutput || '').localeCompare(String(a.lastOutput || ''))
+      })
+      return h('div', { style: S.summaryPanel },
+        h('div', { style: S.summaryHead },
+          h('span', { style: S.summaryTitle }, '主线'),
+          h('span', { style: S.muted }, `未清 ${open.length} 条 / 共 ${all.length} 条 · 截至 ${today}`),
+        ),
+        rows.length === 0
+          ? h('div', { style: S.muted }, '所有主线都已收尾。')
+          : h('div', { style: { overflowX: 'auto' } },
+            h('table', { style: S.summaryTable },
+              h('thead', null, h('tr', null,
+                ['主线', '工作区', '状态', '最近产出', '挂起'].map(label => h('th', { key: label, style: S.summaryTh }, label)))),
+              h('tbody', null, rows.map(item => h('tr', { key: item.id },
+                h('td', { style: S.summaryTd },
+                  h('div', { style: { fontWeight: 600 } }, item.title),
+                  h('div', { style: S.muted }, item.id)),
+                h('td', { style: S.summaryTd, title: item.workspace || '' }, workspaceLeaf(item.workspace)),
+                h('td', { style: S.summaryTd }, h('span', { style: S.statusChip(item.status) }, item.status)),
+                h('td', { style: S.summaryTd }, item.lastOutput || '—'),
+                h('td', { style: S.summaryTd }, item.stallDays ? `${item.stallDays} 天` : '—'),
+              )))),
+          ),
+      )
+    }
+
     function ReportsView({ state, focus, onFocusDone }) {
       const reports = state.reports || []
       const [selected, setSelected] = useState(reports.length > 0 ? reports[0].file : null)
@@ -504,23 +675,31 @@ window.__ModuleLoader__.load({
         onFocusDone()
       }, [focus, reports, onFocusDone])
       const current = reports.find(report => report.file === selected)
-      if (reports.length === 0) return h('div', { style: S.empty }, '这个目录里还没有日报。')
-      return h('div', { style: S.split },
-        h('div', { style: S.list }, reports.map(report => h('button', {
-          key: report.file,
-          type: 'button',
-          onClick: () => setSelected(report.file),
-          style: S.item(report.file === selected),
-          title: `${report.file} · ${Math.round(report.size / 102.4) / 10} KB`,
-        }, report.date))),
-        h('div', { style: S.doc },
-          current
-            ? [
-              h('div', { key: 'meta', style: S.muted },
-                `${current.date} · ${Math.round(current.size / 102.4) / 10} KB · ${current.file}`),
-              ...current.content.split(/\r?\n/).map(renderLine),
-            ]
-            : h('div', { style: S.empty }, '选一天看。'),
+      if (reports.length === 0) {
+        return h('div', null,
+          h(MainlinePanel, { mainlines: state.mainlines, today: state.today }),
+          h('div', { style: S.empty }, '这个目录里还没有日报。'),
+        )
+      }
+      return h('div', null,
+        h(MainlinePanel, { mainlines: state.mainlines, today: state.today }),
+        h('div', { style: S.split },
+          h('div', { style: S.list }, reports.map(report => h('button', {
+            key: report.file,
+            type: 'button',
+            onClick: () => setSelected(report.file),
+            style: S.item(report.file === selected),
+            title: `${report.file} · ${Math.round(report.size / 102.4) / 10} KB`,
+          }, report.date))),
+          h('div', { style: S.doc },
+            current
+              ? [
+                h('div', { key: 'meta', style: S.muted },
+                  `${current.date} · ${Math.round(current.size / 102.4) / 10} KB · ${current.file}`),
+                ...renderMarkdown(current.content),
+              ]
+              : h('div', { style: S.empty }, '选一天看。'),
+          ),
         ),
       )
     }
@@ -551,7 +730,7 @@ window.__ModuleLoader__.load({
             ? [
               h('div', { key: 'meta', style: S.muted },
                 `${current.period} · ${Math.round(current.size / 102.4) / 10} KB · ${current.file}`),
-              ...current.content.split(/\r?\n/).map(renderLine),
+              ...renderMarkdown(current.content),
             ]
             : h('div', { style: S.empty }, '选一份周期报告看。'),
         ),
@@ -962,6 +1141,7 @@ window.__ModuleLoader__.load({
       const [monthActive, setMonthActive] = useState(true)
       const [reportDir, setReportDir] = useState('')
       const [workspace, setWorkspace] = useState('')
+      const [discovered, setDiscovered] = useState([])
       const [logDir, setLogDir] = useState('')
       const [busy, setBusy] = useState(false)
       const [notice, setNotice] = useState(null)
@@ -993,6 +1173,14 @@ window.__ModuleLoader__.load({
         } catch (cause) {
           setError(`读取定时设置失败：${cause && cause.message ? cause.message : String(cause)}`)
         }
+        // 工作区清单是只读展示，读不到不影响设置页其他部分。
+        try {
+          const response = await fetch(ENDPOINT, { cache: 'no-store' })
+          const payload = await response.json()
+          if (response.ok && Array.isArray(payload.workspaces)) setDiscovered(payload.workspaces)
+        } catch {
+          setDiscovered([])
+        }
       }, [applyPayload])
 
       useEffect(() => { load() }, [load])
@@ -1011,6 +1199,16 @@ window.__ModuleLoader__.load({
           if (!response.ok) throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`)
           setInfo(payload)
           applyPayload(payload)
+          // 改了额外根之后，最近一次采集的清单可能就旧了；顺手重拉一次，失败不影响保存结果。
+          if (Object.prototype.hasOwnProperty.call(patch, 'workspace')) {
+            try {
+              const stateResponse = await fetch(ENDPOINT, { cache: 'no-store' })
+              const statePayload = await stateResponse.json()
+              if (stateResponse.ok && Array.isArray(statePayload.workspaces)) setDiscovered(statePayload.workspaces)
+            } catch {
+              // 只影响设置页下方的只读列表
+            }
+          }
           setNotice('已保存')
         } catch (cause) {
           setError(`保存失败：${cause && cause.message ? cause.message : String(cause)}`)
@@ -1109,22 +1307,27 @@ window.__ModuleLoader__.load({
         h('div', { style: { ...S.hint, marginTop: 4 } },
           `默认 ${info.reportDirDefault}；日报、看板、_源数据 都写在这里。改目录不会搬动已有文件。`,
         ),
-        h('h3', { style: S.boardHead }, '工作空间'),
+        h('h3', { style: S.boardHead }, '工作区'),
+        h('div', { style: { ...S.hint, marginBottom: 6 } },
+          '工作区不用登记：每次采集会从近两天有活动的 DSH 会话里自动发现。下面这一项只是额外固定的根，可留空。'),
         h('div', { style: S.field },
-          h('span', { style: S.label }, '目录'),
+          h('span', { style: S.label }, '额外根'),
           h('input', {
             type: 'text',
             value: workspace,
-            placeholder: info.workspaceDefault,
+            placeholder: '可选：例如 F:\\projects',
             style: { ...S.input, width: 360 },
             onChange: event => setWorkspace(event.target.value),
           }),
           h('button', { type: 'button', style: S.ghost, disabled: busy, onClick: () => save({ workspace }) },
-            busy ? '保存中…' : '保存目录'),
+            busy ? '保存中…' : '保存根目录'),
         ),
-        h('div', { style: { ...S.hint, marginTop: 4 } },
-          '日报从这里扫当天改了哪些文件、有哪些 git 仓库；默认和插件数据目录同一个（装好就有），填你平时干活的目录更贴合实际。',
-        ),
+        discovered.length > 0
+          ? h('div', { style: { ...S.hint, marginTop: 6 } },
+            '最近一次采集发现的工作区：',
+            ...discovered.map(item => h('div', { key: item.path, style: { ...S.hint, marginTop: 2 } },
+              `${item.name}  ${item.path}  （会话 ${item.sessions} · 当日改动 ${item.files} 个文件）`)))
+          : h('div', { style: { ...S.hint, marginTop: 6 } }, '还没有采集记录；跑一次日报采集后这里会列出发现的工作区。'),
         scheduleBlock,
         periodBlock('周报', '每周一生成上一周（周一至周日）', info.week,
           weekTime, setWeekTime, 'weekTime', 'weekActive', weekActive, setWeekActive),
@@ -1214,7 +1417,7 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots'],
-      __test: { activeWorkspace, boardStartPrompt, startBoardTask, buildTrend, boardStats, StatsView },
+      __test: { activeWorkspace, boardStartPrompt, startBoardTask, buildTrend, boardStats, StatsView, renderMarkdown, MainlinePanel, workspaceLeaf },
       apply(ctx) {
         appCtx = ctx
         ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({

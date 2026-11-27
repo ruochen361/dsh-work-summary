@@ -12,6 +12,7 @@ param(
   [string]$DshHome = (Join-Path $HOME '.dsh'),
   [string]$Workspace = (Join-Path $DshHome 'dsh-work-summary'),
   [string]$ReportDir = (Join-Path $DshHome 'dsh-work-summary'),
+  [int]$StallDays = 3,
   [switch]$NoSessions
 )
 
@@ -117,6 +118,142 @@ foreach ($day in $days) {
   if (-not (Test-Path (Join-Path $outDir "$day.md"))) { $missingSource += $day }
 }
 
+# ---------- 主线：日报里的小节 + _主线.md 账本 ----------
+# 主线是「一次完整交付」，ID 形如 M-YYYY-MM-DD-NN；日报小节给工作区/状态/判据，
+# 账本补首次与最近产出，所以两边要合起来看。
+$mainlines = @{}
+$mainlineOrder = @()
+
+function Get-Mainline([string]$id) {
+  if (-not $script:mainlines.ContainsKey($id)) {
+    $script:mainlines[$id] = [pscustomobject]@{
+      Id = $id; Title = ''; Workspace = ''; Status = '进行中'
+      First = ''; Last = ''; Days = @()
+      CriteriaDone = 0; CriteriaTotal = 0; TextTotal = 0
+    }
+    $script:mainlineOrder += $id
+  }
+  return $script:mainlines[$id]
+}
+
+foreach ($day in $days) {
+  if (-not $daily.ContainsKey($day)) { continue }
+  $cur = $null
+  foreach ($raw in $daily[$day]) {
+    $line = $raw.Trim()
+    if ($line -match '^####\s+(M-\d{4}-\d{2}-\d{2}-\d{2})\s*(.*)$') {
+      $cur = Get-Mainline $Matches[1]
+      if ($Matches[2].Trim()) { $cur.Title = $Matches[2].Trim() }
+      if (-not ($cur.Days -contains $day)) { $cur.Days += $day }
+      continue
+    }
+    if ($line -match '^#{1,5}\s') { $cur = $null; continue }
+    if (-not $cur) { continue }
+    if ($line -match '^-\s*工作区\s*[：:]\s*(.+)$') { $cur.Workspace = $Matches[1].Trim().Trim('`') }
+    elseif ($line -match '^-\s*状态\s*[：:]\s*(.+)$') { $cur.Status = $Matches[1].Trim() }
+    elseif ($line -match '^-\s*\[( |x|X)\]\s*(.+)$') {
+      $cur.CriteriaTotal = [int]$cur.CriteriaTotal + 1
+      if ($Matches[1] -ne ' ') { $cur.CriteriaDone = [int]$cur.CriteriaDone + 1 }
+    } elseif ($line -match '^-\s*判据\s*[：:]\s*(.+)$') {
+      foreach ($part in ($Matches[1] -split '[；;]')) {
+        if ($part.Trim()) { $cur.TextTotal = [int]$cur.TextTotal + 1 }
+      }
+    }
+  }
+}
+
+$ledgerPath = Join-Path $ReportDir '_主线.md'
+if (Test-Path $ledgerPath) {
+  $cur = $null
+  foreach ($raw in (Get-Content $ledgerPath -Encoding UTF8)) {
+    $line = $raw.Trim()
+    if ($line -match '^##\s+(M-\d{4}-\d{2}-\d{2}-\d{2})\s*(.*)$') {
+      $cur = Get-Mainline $Matches[1]
+      if ($Matches[2].Trim()) { $cur.Title = $Matches[2].Trim() }
+      continue
+    }
+    if (-not $cur) { continue }
+    if ($line -match '^-\s*工作区\s*[：:]\s*(.+)$') { if (-not $cur.Workspace) { $cur.Workspace = $Matches[1].Trim().Trim('`') } }
+    elseif ($line -match '^-\s*状态\s*[：:]\s*(.+)$') { $cur.Status = $Matches[1].Trim() }
+    elseif ($line -match '^-\s*首次产出\s*[：:]\s*(.+)$') { $cur.First = $Matches[1].Trim() }
+    elseif ($line -match '^-\s*最近产出\s*[：:]\s*(.+)$') { $cur.Last = $Matches[1].Trim() }
+    elseif ($line -match '^-\s*\[( |x|X)\]\s*(.+)$') {
+      $cur.CriteriaTotal = [int]$cur.CriteriaTotal + 1
+      if ($Matches[1] -ne ' ') { $cur.CriteriaDone = [int]$cur.CriteriaDone + 1 }
+    }
+  }
+}
+
+$mainlineRows = @()
+foreach ($id in $mainlineOrder) {
+  # 区间结束后才出现的主线不能倒灌进历史周期。
+  if ($id.Substring(2, 10) -gt $To) { continue }
+  $m = $mainlines[$id]
+  $first = $m.First
+  $last = $m.Last
+  foreach ($d in $m.Days) {
+    if (-not $first -or $d -lt $first) { $first = $d }
+    if (-not $last -or $d -gt $last) { $last = $d }
+  }
+  if (-not $first) { $first = $last }
+  if (-not $last) { $last = $first }
+  # 手工改过的账本可能写 `—` 或带说明；非日期一律当没写，避免后面 Substring 抛错。
+  if ($first -and $first -notmatch '^\d{4}-\d{2}-\d{2}$') { $first = '' }
+  if ($last -and $last -notmatch '^\d{4}-\d{2}-\d{2}$') { $last = '' }
+  if (-not $first) { $first = $last }
+  if (-not $last) { $last = $first }
+  if ($first -gt $To) { continue }
+  $touched = $m.Days.Count -gt 0
+  $open = $m.Status -notin @('完成', '放弃')
+  if (-not $open -and -not $touched) { continue }
+  $stall = 0
+  if ($last) {
+    try { $stall = ($toDay - [datetime]::ParseExact($last, 'yyyy-MM-dd', $null)).Days }
+    catch { $stall = 0 }
+    if ($stall -lt 0) { $stall = 0 }
+  }
+  $status = $m.Status
+  if ($open -and $stall -ge $StallDays) { $status = '受阻' }
+  $critTotal = $m.CriteriaTotal
+  if ($critTotal -eq 0 -and $m.TextTotal -gt 0) { $critTotal = $m.TextTotal }
+  $mainlineRows += [pscustomobject]@{
+    Id = $id; Title = $m.Title; Workspace = $m.Workspace; Status = $status
+    First = $first; Last = $last; Stall = $stall
+    CriteriaDone = $m.CriteriaDone; CriteriaTotal = $critTotal
+    Touched = $touched
+  }
+}
+
+# 工作区别名：_工作区.md 的「## 别名」段，`- <路径> = <名字>`。
+$aliasMap = @{}
+$wsDoc = Join-Path $ReportDir '_工作区.md'
+if (Test-Path $wsDoc) {
+  $inAlias = $false
+  $inComment = $false
+  foreach ($line in (Get-Content $wsDoc -Encoding UTF8)) {
+    $trimmed = $line.Trim()
+    # 跳过 <!-- … --> 块注释，注释里的示例不能被当成真实别名。
+    if ($inComment) {
+      if ($trimmed -match '-->') { $inComment = $false }
+      continue
+    }
+    if ($trimmed -match '^<!--') { $inComment = $true; continue }
+    if ($line -match '^##\s*别名') { $inAlias = $true; continue }
+    if ($line -match '^##\s') { $inAlias = $false; continue }
+    if ($inAlias -and $line -match '^\s*-\s*(.+?)\s*=\s*(.+?)\s*$') {
+      $aliasMap[$Matches[1].Trim().Trim('`').ToLower()] = $Matches[2].Trim()
+    }
+  }
+}
+function Format-Workspace([string]$path) {
+  if (-not $path) { return '（未标工作区）' }
+  $firstPath = ($path -split '[,，]')[0].Trim()
+  if ($aliasMap.ContainsKey($firstPath.ToLower())) { return $aliasMap[$firstPath.ToLower()] }
+  $leaf = Split-Path $firstPath -Leaf
+  if ($leaf) { return $leaf }
+  return $firstPath
+}
+
 # ---------- 工作区改动 ----------
 $files = @()
 if (Test-Path $Workspace) {
@@ -184,6 +321,8 @@ Add-Line "- 源数据：有 $(($days.Count - $missingSource.Count)) 天 / 缺 $(
 Add-Line "- 工作区改动：$($files.Count) 个文件"
 Add-Line "- Git：$($repos.Count) 个仓库，$gitCommitCount 条提交"
 Add-Line "- 看板：未完成 $openTotal 条"
+$openMainlines = @($mainlineRows | Where-Object { $_.Status -notmatch '完成|放弃' })
+Add-Line "- 主线：$($mainlineRows.Count) 条（未清 $($openMainlines.Count) 条）"
 Add-Line ''
 
 Add-Line '## 2. 日报覆盖'
@@ -383,6 +522,31 @@ if (-not $repeat) {
   }
 }
 Add-Line ''
+
+Add-Line '## 12. 主线（区间）'
+Add-Line ''
+if ($mainlineRows.Count -eq 0) {
+  Add-Line '_区间内日报没有主线小节，`_主线.md` 也没有未清条目。_'
+} else {
+  Add-Line '按工作区分组；「本期未推进」是账本里有、但区间日报没有小节的未清主线。'
+  Add-Line ''
+  $groups = $mainlineRows | Group-Object { Format-Workspace $_.Workspace } | Sort-Object Name
+  foreach ($group in $groups) {
+    Add-Line "### $($group.Name)"
+    Add-Line ''
+    foreach ($row in ($group.Group | Sort-Object First, Id)) {
+      $firstText = if ($row.First) { $row.First.Substring(5) } else { '—' }
+      $lastText = if ($row.Last) { $row.Last.Substring(5) } else { '—' }
+      $span = if ($firstText -ne '—' -and $firstText -eq $lastText) { $firstText } else { "$firstText → $lastText" }
+      $parts = @($row.Status)
+      if ($row.CriteriaTotal -gt 0) { $parts += ("判据 {0}/{1}" -f $row.CriteriaDone, $row.CriteriaTotal) }
+      if ($row.Stall -gt 0) { $parts += ("挂起 {0} 天" -f $row.Stall) }
+      if (-not $row.Touched) { $parts += '本期未推进' }
+      Add-Line ("- {0} {1}：{2}（{3}）" -f $row.Id, $row.Title, $span, ($parts -join '，'))
+    }
+    Add-Line ''
+  }
+}
 
 Set-Content -Path $outFile -Value $sb -Encoding UTF8
 Write-Output $outFile
