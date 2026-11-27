@@ -1,6 +1,6 @@
 {
   "name": "dsh-work-summary",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Daily, weekly and monthly work reports for DeepSeek Harness: collect traces, write and validate reports, push next actions onto the board.",
   "repository": {
     "type": "git",
@@ -42,7 +42,7 @@
     "dsh": ">=0.2.2-rc.5 <0.3.0"
   },
   "scripts": {
-    "test": "node test/stats.test.mjs && node test/markdown.test.mjs && node test/workspace.test.mjs && node test/mainline.test.mjs && node test/board-start.test.mjs && node test/route.test.mjs && node test/period.test.mjs && node test/quality.test.mjs && node test/archive.test.mjs",
+    "test": "node test/stats.test.mjs && node test/markdown.test.mjs && node test/workspace.test.mjs && node test/mainline.test.mjs && node test/board-start.test.mjs && node test/route.test.mjs && node test/period.test.mjs && node test/quality.test.mjs && node test/archive.test.mjs && node test/usage.test.mjs",
     "check": "node --check index.js && node --check client.js"
   },
   "dsh": {

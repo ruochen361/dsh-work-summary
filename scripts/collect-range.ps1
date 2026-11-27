@@ -50,6 +50,26 @@ function Test-SkipPath([string]$rel) {
 $sb = [System.Collections.Generic.List[string]]::new()
 function Add-Line([string]$s = '') { $sb.Add($s) }
 
+# 投入统计的展示格式，与 collect-day.ps1 保持一致。
+function Format-Duration([long]$ms) {
+  if ($ms -le 0) { return '0m' }
+  $m = [int][Math]::Floor($ms / 60000 + 0.5)
+  if ($m -lt 1) { return '<1m' }
+  if ($m -lt 60) { return "${m}m" }
+  return ('{0}h{1:00}m' -f [int][Math]::Floor($m / 60), ($m % 60))
+}
+
+function Format-TokenCount([long]$n) {
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  if ($n -ge 999950) { return [string]::Format($inv, '{0:0.0}M', $n / 1000000.0) }
+  if ($n -ge 1000) { return [string]::Format($inv, '{0:0.0}K', $n / 1000.0) }
+  return "$n"
+}
+
+function Format-Percent([double]$value) {
+  return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0.0}%', $value)
+}
+
 function Get-Section([string[]]$content, [string]$number) {
   $start = -1
   for ($i = 0; $i -lt $content.Count; $i++) {
@@ -117,6 +137,63 @@ $missingSource = @()
 foreach ($day in $days) {
   if (-not (Test-Path (Join-Path $outDir "$day.md"))) { $missingSource += $day }
 }
+
+# ---------- 投入（token / 时间）：读各日源数据里的 dsh-usage 注释 ----------
+# 单日内部已经做过会话并集，所以区间直接按天相加；旧源数据没有这一节就标缺，提示重新采集。
+$usageDays = @{}
+foreach ($day in $days) {
+  $p = Join-Path $outDir "$day.md"
+  if (-not (Test-Path $p)) { continue }
+  foreach ($line in (Get-Content $p -Encoding UTF8)) {
+    if ($line -match '^<!--\s*dsh-usage\s+(\{.*\})\s*-->\s*$') {
+      try { $usageDays[$day] = $Matches[1] | ConvertFrom-Json } catch { }
+      break
+    }
+  }
+}
+$usageMissing = @($days | Where-Object { -not $usageDays.ContainsKey($_) })
+
+$uSessions = [long]0; $uActive = [long]0; $uModel = [long]0; $uTool = [long]0; $uWait = [long]0
+$uInput = [long]0; $uCache = [long]0; $uOutput = [long]0; $uTotal = [long]0
+$uByWs = @{}
+$uWsOrder = [System.Collections.Generic.List[string]]::new()
+foreach ($day in ($usageDays.Keys | Sort-Object)) {
+  $u = $usageDays[$day]
+  $uSessions += [long]$u.sessions
+  $uActive += [long]$u.activeMs
+  $uModel += [long]$u.modelMs
+  $uTool += [long]$u.toolMs
+  $uWait += [long]$u.waitMs
+  $uInput += [long]$u.input
+  $uCache += [long]$u.cache
+  $uOutput += [long]$u.output
+  $uTotal += [long]$u.total
+  foreach ($w in @($u.byWorkspace)) {
+    $key = if ($w.path) { ([string]$w.path).ToLowerInvariant() } else { [string]$w.name }
+    if (-not $uByWs.ContainsKey($key)) {
+      $uByWs[$key] = [pscustomobject]@{
+        Name = [string]$w.name; Path = [string]$w.path; Sessions = [long]0
+        ActiveMs = [long]0; ModelMs = [long]0; ToolMs = [long]0; WaitMs = [long]0
+        Input = [long]0; Cache = [long]0; Output = [long]0; Total = [long]0
+      }
+      $uWsOrder.Add($key)
+    }
+    $g = $uByWs[$key]
+    $g.Sessions += [long]$w.sessions
+    $g.ActiveMs += [long]$w.activeMs
+    $g.ModelMs += [long]$w.modelMs
+    $g.ToolMs += [long]$w.toolMs
+    $g.WaitMs += [long]$w.waitMs
+    $g.Input += [long]$w.input
+    $g.Cache += [long]$w.cache
+    $g.Output += [long]$w.output
+    $g.Total += [long]$w.total
+  }
+}
+$uRows = @($uWsOrder | ForEach-Object { $uByWs[$_] } |
+  Sort-Object -Property @{ Expression = 'ActiveMs'; Descending = $true })
+$uDenom = $uInput + $uCache
+$uHit = if ($uDenom -gt 0) { $uCache / $uDenom * 100 } else { 0 }
 
 # ---------- 主线：日报里的小节 + _主线.md 账本 ----------
 # 主线是「一次完整交付」，ID 形如 M-YYYY-MM-DD-NN；日报小节给工作区/状态/判据，
@@ -323,6 +400,16 @@ Add-Line "- Git：$($repos.Count) 个仓库，$gitCommitCount 条提交"
 Add-Line "- 看板：未完成 $openTotal 条"
 $openMainlines = @($mainlineRows | Where-Object { $_.Status -notmatch '完成|放弃' })
 Add-Line "- 主线：$($mainlineRows.Count) 条（未清 $($openMainlines.Count) 条）"
+if ($usageDays.Count -eq 0) {
+  Add-Line '- 投入：区间内没有 token/时间数据（源数据未含投入节，重新采集该日即可补上）'
+} else {
+  Add-Line ("- 投入：活跃 {0} · 模型 {1} · 工具 {2} · 等你确认 {3}（覆盖 {4}/{5} 天）" -f
+    (Format-Duration $uActive), (Format-Duration $uModel), (Format-Duration $uTool),
+    (Format-Duration $uWait), $usageDays.Count, $days.Count)
+  Add-Line ("- Token：合计 {0}（新输入 {1} / 缓存读 {2} / 输出 {3}，缓存命中 {4}）" -f
+    (Format-TokenCount $uTotal), (Format-TokenCount $uInput), (Format-TokenCount $uCache),
+    (Format-TokenCount $uOutput), (Format-Percent $uHit))
+}
 Add-Line ''
 
 Add-Line '## 2. 日报覆盖'
@@ -546,6 +633,60 @@ if ($mainlineRows.Count -eq 0) {
     }
     Add-Line ''
   }
+}
+
+Add-Line '## 13. 投入（token / 时间，区间）'
+Add-Line ''
+if ($usageDays.Count -eq 0) {
+  Add-Line '_区间源数据都没有投入节；重新采集这些日期即可补上。_'
+} else {
+  Add-Line ("**投入：** 会话·日 {0} 个 · 活跃 {1} · 模型 {2} · 工具 {3} · 等你确认 {4}" -f
+    $uSessions, (Format-Duration $uActive), (Format-Duration $uModel),
+    (Format-Duration $uTool), (Format-Duration $uWait))
+  Add-Line ("**Token：** 合计 {0}（新输入 {1} / 缓存读 {2} / 输出 {3}，缓存命中 {4}）" -f
+    (Format-TokenCount $uTotal), (Format-TokenCount $uInput), (Format-TokenCount $uCache),
+    (Format-TokenCount $uOutput), (Format-Percent $uHit))
+  Add-Line ''
+  Add-Line '| 工作区 | 会话·日 | 活跃 | 模型 | 工具 | 等你确认 | Token | 缓存读 | 命中 |'
+  Add-Line '|---|---|---|---|---|---|---|---|---|'
+  foreach ($row in $uRows) {
+    $denom = $row.Input + $row.Cache
+    $hit = if ($denom -gt 0) { $row.Cache / $denom * 100 } else { 0 }
+    Add-Line ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} |" -f
+      $row.Name, $row.Sessions, (Format-Duration $row.ActiveMs), (Format-Duration $row.ModelMs),
+      (Format-Duration $row.ToolMs), (Format-Duration $row.WaitMs), (Format-TokenCount $row.Total),
+      (Format-TokenCount $row.Cache), (Format-Percent $hit))
+  }
+  Add-Line ''
+  Add-Line ("- 覆盖：{0}/{1} 天有投入数据；跳过 {2} 天（旧源数据没有该节，重新采集即可补上）。" -f
+    $usageDays.Count, $days.Count, $usageMissing.Count)
+  if ($usageMissing.Count -gt 0) {
+    $preview = @($usageMissing | Select-Object -First 12)
+    $suffix = if ($usageMissing.Count -gt 12) { ' …' } else { '' }
+    Add-Line ("- 缺投入的日期：{0}{1}" -f ($preview -join '、'), $suffix)
+  }
+  Add-Line '- 口径：同每日源数据 3.5 节；区间按天相加，单日内部已完成会话并集。'
+  $rangeJson = [ordered]@{
+    sessions = $uSessions
+    activeMs = $uActive
+    modelMs = $uModel
+    toolMs = $uTool
+    waitMs = $uWait
+    input = $uInput
+    cache = $uCache
+    output = $uOutput
+    total = $uTotal
+    days = $days.Count
+    daysWithUsage = $usageDays.Count
+    byWorkspace = @($uRows | ForEach-Object {
+      [ordered]@{
+        name = $_.Name; path = $_.Path; sessions = $_.Sessions
+        activeMs = $_.ActiveMs; modelMs = $_.ModelMs; toolMs = $_.ToolMs; waitMs = $_.WaitMs
+        input = $_.Input; cache = $_.Cache; output = $_.Output; total = $_.Total
+      }
+    })
+  }
+  Add-Line ('<!-- dsh-usage-range ' + ($rangeJson | ConvertTo-Json -Compress -Depth 5) + ' -->')
 }
 
 Set-Content -Path $outFile -Value $sb -Encoding UTF8

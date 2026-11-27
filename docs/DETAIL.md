@@ -80,6 +80,19 @@
 - 落盘：周报 `周报-<from>_<to>.md`；整月 `月报-YYYY-MM.md`，非整月 `月报-<from>_<to>.md`；自定义 `周期-<from>_<to>.md`。
 - 看板：只推最后一节，`push-to-board.ps1 -Section <末节名>`，按标题 / 条目指纹去重，同一区间连跑第二次新增 0 条。
 
+## 投入统计（token / 时间）
+
+`collect-day.ps1` 在采集时就把投入算好，写进源数据第 3.5 节；日报、周报、月报只照抄，不重新估算。
+
+- 数据来源：`~/.dsh/sessions/**/session.v4.jsonl.zstd`（多 zstd frame，按 magic 逐帧解）。token 只认 `assistant/message.data.usage`（`inputTokens` / `outputTokens` / `cacheReadTokens` / `totalTokens`），`assistant/attempt` 里的 0 值占位不计。
+- 活跃：会话内事件时间排序，相邻间隔封顶 5 分钟再求和；多个并行会话的活跃区间取并集，不直接相加。按工作区表里的「活跃」是组内并集，合计行是全工作区并集，所以合计可能小于各行之和。
+- 模型：`assistant/message` 首个 stream 块的时间（`time` 或 `time0`）到消息落盘时间。
+- 工具：`tool/call` → `tool/result` 按 callId 配对，单次封顶 10 分钟；`ask_user_question` 与 `plugin_manager` 属于「等你回话 / 审批」，单列 `等你确认`，不计入工具耗时。
+- 输出：日报源数据 `## 3.5 投入统计（token / 时间）`，含 `**投入：**`、`**Token：**`、按工作区 11 列表格、口径脚注与 `<!-- dsh-usage {...} -->`；区间源数据 `## 13. 投入（token / 时间，区间）` 按天相加，含覆盖 N/M 天、缺日期、按工作区 9 列表格与 `<!-- dsh-usage-range {...} -->`。缺数据的旧区间不会静默留空：第 1 节写「区间内没有 token/时间数据」，第 13 节提示按正常方式重新采集即可补上。
+- Host：`daily_report_collect` 解析当天源数据的注释，返回 `usage` 与 `usageLine`；`work_summary_period` 解析区间注释，自动草稿第一节自带投入两行 + 按工作区表，返回值带 `usage` / `usageLine`。
+- 软校验：`daily_report_save` / `work_summary_period` 在源数据有投入、正文却没有任何 token 数字时给一条提醒（不阻断落盘），提醒把 3.5 节的原句补进「一、今日概览」表下。
+- 缓存命中率 = `cache / (input + cache)`；金额换算不内置，需要时按单价自己乘。
+
 ## 计划任务
 
 `scheduleEnabled` 打开时（默认打开），插件在激活后确保存在三条托管任务。日报按标题（精确或前缀）识别，周报 / 月报按各自标题识别；日报还会用提示词认领引用 `collect-day.ps1` 的旧任务，避免互相认领：

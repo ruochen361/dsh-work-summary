@@ -30,6 +30,7 @@
 | `test/stats.test.mjs` | 统计页：趋势补零、7 日均值、默认 30 天窗口、看板交付计数、空看板、渲染冒烟 |
 | `test/markdown.test.mjs` | 正文表格：表头合成、对齐、列裁剪补空、转义竖线、无分隔行回退纯文本 |
 | `test/workspace.test.mjs` | 工作区发现：会话 cwd 自动发现、`_工作区.md` 别名与忽略、父子去重、无会话回退 |
+| `test/usage.test.mjs` | 投入统计：单日 token/活跃/模型/工具/等你确认、按工作区与未归属、区间求和与覆盖天数、Host 软校验与周期草稿 |
 | `test/mainline.test.mjs` | 主线账本：生成、旧 ID 复用、未知 ID 拒绝、挂起提醒、采集第 7 节、缺状态行 / 否定状态 / 单数字 ID、补写不回拨、备注保留 |
 | `docs/DETAIL.md` | 机制与配置细节 |
 | `docs/ROADMAP.md` | 需求清单，一需求一 ID |
@@ -38,7 +39,7 @@
 
 ```powershell
 npm run check                      # node --check index.js && node --check client.js
-npm test                           # stats + markdown + workspace + mainline + board-start + route + period + quality + archive 九份测试
+npm test                           # stats + markdown + workspace + mainline + board-start + route + period + quality + archive + usage 十份测试
 node test/stats.test.mjs           # 单跑（纯客户端，不启动 pwsh）
 node test/markdown.test.mjs        # 单跑（纯客户端，不启动 pwsh）
 node test/workspace.test.mjs       # 单跑（启动 pwsh + zstd 造会话文件）
@@ -48,9 +49,10 @@ node test/period.test.mjs          # 单跑
 node test/quality.test.mjs         # 单跑
 node test/archive.test.mjs         # 单跑
 node test/board-start.test.mjs     # 单跑
+node test/usage.test.mjs           # 单跑（启动 pwsh + zstd 造会话文件）
 ```
 
-测试会启动 `pwsh`。在 DSH 沙箱里，受限模式会因命名管道报 `Access to the path '\\.\pipe\LOCAL\dotnet_...' is denied`，需要以完整权限运行；`mainline.test.mjs` 的子进程用 `stdio: 'inherit'`，受限模式下也能单跑。测试使用 `test/.tmp-period`、`test/.tmp-quality`、`test/.tmp-archive`、`test/.tmp-workspace`、`test/.tmp-mainline` 与 `_probe` 作为临时根，不要指向真实的 `~/.dsh/dsh-work-summary`。
+测试会启动 `pwsh`。在 DSH 沙箱里，受限模式会因命名管道报 `Access to the path '\\.\pipe\LOCAL\dotnet_...' is denied`，需要以完整权限运行；`mainline.test.mjs` 的子进程用 `stdio: 'inherit'`，受限模式下也能单跑。测试使用 `test/.tmp-period`、`test/.tmp-quality`、`test/.tmp-archive`、`test/.tmp-workspace`、`test/.tmp-mainline`、`test/.tmp-usage` 与 `_probe` 作为临时根，不要指向真实的 `~/.dsh/dsh-work-summary`。
 
 ## 编码约定
 
@@ -83,3 +85,4 @@ node test/board-start.test.mjs     # 单跑
 - 数据文件命名：`日报-YYYY-MM-DD.md`、`周报-from_to.md`、整月 `月报-YYYY-MM.md`、非整月 `月报-from_to.md`、自定义 `周期-from_to.md`。
 - 源数据归档：`_源数据` 只保留最近 60 个 `.md`；更旧的按数据日期分季度写入 `_归档/YYYY-QN.zip`，成功校验条目后才删原文件，失败只记一行且不阻断采集。
 - 工作区：采集窗口是「日历日 D-1 ~ D」两个自然日；源数据第 0 节列出发现的工作区（名字、路径、会话数、工具调用数、当日改动文件数），Host 解析成 `workspaces` 随采集结果返回；页面只读展示，不提供编辑。
+- 投入统计：`collect-day.ps1` 写源数据 `## 3.5 投入统计（token / 时间）`，`collect-range.ps1` 汇总为 `## 13. 投入（token / 时间，区间）`；两处都带 `<!-- dsh-usage -->` / `<!-- dsh-usage-range -->` 机器可读行。口径：活跃间隔封顶 5 分钟且多会话并集、模型取回复流首末、工具调用单次封顶 10 分钟、`ask_user_question` 与 `plugin_manager` 单列「等你确认」；token 只认 `assistant/message.usage`。Host 用 `parseUsageComment` 透出 `usage` / `usageLine`，正文漏写时只软提醒。

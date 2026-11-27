@@ -557,6 +557,70 @@ function qualityWarnings(content, minEvidence) {
   return warnings
 }
 
+/**
+ * 投入统计（R35）：展示格式与 `scripts/collect-day.ps1` / `collect-range.ps1` 的
+ * `Format-Duration` / `Format-TokenCount` 对齐，避免同一组数字在源数据和正文里长得不一样。
+ */
+function formatDuration(ms) {
+  const value = Number(ms) || 0
+  if (value <= 0) return '0m'
+  const minutes = Math.round(value / 60000)
+  if (minutes < 1) return '<1m'
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`
+}
+
+function formatTokens(value) {
+  const n = Number(value) || 0
+  // 999950 起改显示 M：否则 999_950 会被四舍五入成「1000.0K」。
+  if (n >= 999950) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`
+  return String(n)
+}
+
+function usageHitRate(usage) {
+  const denom = (Number(usage?.input) || 0) + (Number(usage?.cache) || 0)
+  return denom > 0 ? (Number(usage.cache) / denom * 100).toFixed(1) : '0.0'
+}
+
+function usageParts(usage, options = {}) {
+  const { sessions = true, dayLabel = '会话' } = options
+  const parts = []
+  if (sessions && Number(usage?.sessions) > 0) parts.push(`${dayLabel} ${usage.sessions} 个`)
+  parts.push(`活跃 ${formatDuration(usage?.activeMs)}`)
+  parts.push(`模型 ${formatDuration(usage?.modelMs)}`)
+  parts.push(`工具 ${formatDuration(usage?.toolMs)}`)
+  parts.push(`等你确认 ${formatDuration(usage?.waitMs)}`)
+  return parts.join(' · ')
+}
+
+function usageTokenParts(usage) {
+  return `合计 ${formatTokens(usage?.total)}（新输入 ${formatTokens(usage?.input)} / 缓存读 ${formatTokens(usage?.cache)}`
+    + ` / 输出 ${formatTokens(usage?.output)}，缓存命中 ${usageHitRate(usage)}%）`
+}
+
+/** 一行式投入汇总，日报正文直接照抄。 */
+function usageSummaryLine(usage, dayLabel = '会话') {
+  if (!usage) return ''
+  return `投入：${usageParts(usage, { dayLabel })}｜Token ${formatTokens(usage?.total)}（新输入 ${formatTokens(usage?.input)}`
+    + ` / 缓存读 ${formatTokens(usage?.cache)} / 输出 ${formatTokens(usage?.output)}，缓存命中 ${usageHitRate(usage)}%）`
+}
+
+/** 源数据里的机器可读行：`<!-- dsh-usage {…} -->`，区间版是 `dsh-usage-range`。 */
+const USAGE_COMMENT = /^<!--\s*dsh-usage(?:-range)?\s+(\{.*\})\s*-->\s*$/m
+
+function parseUsageComment(text) {
+  if (!text) return null
+  const match = USAGE_COMMENT.exec(text)
+  if (!match) return null
+  try {
+    const value = JSON.parse(match[1])
+    return value && typeof value === 'object' ? value : null
+  } catch {
+    return null
+  }
+}
+
 /** 主线 ID 的形态；日期段用于区分「当天新建」与「引用旧账」。 */
 const MAINLINE_ID_SOURCE = 'M-\\d{4}-\\d{2}-\\d{2}-\\d{2}'
 const MAINLINE_HEADING = new RegExp(`^####\\s+(${MAINLINE_ID_SOURCE})\\s*(.*)$`)
@@ -944,7 +1008,7 @@ function periodWorkspaceLabel(workspace) {
  * @param {string} today - 今天 YYYY-MM-DD（用于算待办已挂天数）。
  * @returns {string} 四节正文。
  */
-function composePeriodDraft(range, days, daily, board, today, ledger = [], stallDays = 3) {
+function composePeriodDraft(range, days, daily, board, today, ledger = [], stallDays = 3, usage = null) {
   const spec = PERIOD_KINDS[range.kind] ?? PERIOD_KINDS.custom
   const labels = periodSectionLabels(range.kind)
   const covered = days.filter(day => daily.has(day))
@@ -959,6 +1023,28 @@ function composePeriodDraft(range, days, daily, board, today, ledger = [], stall
   out.push(`## 一、${labels[0]}`, '')
   out.push(`本区间 ${range.from} ~ ${range.to}，共 ${range.span} 天；有日报 ${covered.length} 天${missing.length ? `、缺 ${missing.length} 天（${missing.map(day => day.slice(5)).join('、')}）` : ''}。`)
   out.push('')
+  if (usage) {
+    out.push(`**投入：** ${usageParts(usage, { dayLabel: '会话·日' })}`)
+    out.push(`**Token：** ${usageTokenParts(usage)}`)
+    const rows = Array.isArray(usage.byWorkspace) ? usage.byWorkspace : []
+    if (rows.length > 0) {
+      out.push('')
+      out.push('| 工作区 | 会话·日 | 活跃 | 模型 | 工具 | 等你确认 | Token | 缓存读 | 命中 |')
+      out.push('|---|---|---|---|---|---|---|---|---|')
+      for (const row of rows) {
+        const denom = (Number(row.input) || 0) + (Number(row.cache) || 0)
+        const hit = denom > 0 ? (Number(row.cache) / denom * 100).toFixed(1) : '0.0'
+        out.push(`| ${row.name} | ${row.sessions ?? 0} | ${formatDuration(row.activeMs)} | ${formatDuration(row.modelMs)}`
+          + ` | ${formatDuration(row.toolMs)} | ${formatDuration(row.waitMs)} | ${formatTokens(row.total)}`
+          + ` | ${formatTokens(row.cache)} | ${hit}% |`)
+      }
+    }
+    if (Number(usage.days) > 0 && Number(usage.daysWithUsage) > 0 && usage.daysWithUsage < usage.days) {
+      out.push('')
+      out.push(`_投入覆盖 ${usage.daysWithUsage}/${usage.days} 天；缺的部分重新采集对应日期即可补上。_`)
+    }
+    out.push('')
+  }
   if (covered.length === 0) {
     out.push('_区间内没有日报，无法从记录里归纳主线。_')
   } else if (mainlines.length === 0) {
@@ -1550,6 +1636,22 @@ export function apply(ctx, rawConfig) {
             },
           },
           boardOpen: { type: 'integer' },
+          usage: {
+            type: 'object',
+            description: '当日 token / 时间投入；源数据没有该节时省略（不返回该字段）。',
+            properties: {
+              sessions: { type: 'integer' },
+              activeMs: { type: 'integer' },
+              modelMs: { type: 'integer' },
+              toolMs: { type: 'integer' },
+              waitMs: { type: 'integer' },
+              input: { type: 'integer' },
+              cache: { type: 'integer' },
+              output: { type: 'integer' },
+              total: { type: 'integer' },
+            },
+          },
+          usageLine: { type: 'string', description: '一行式投入汇总，可直接写进日报「一、今日概览」。' },
           template: { type: 'string' },
         },
       },
@@ -1559,6 +1661,9 @@ export function apply(ctx, rawConfig) {
           + (value.workspaces?.length
             ? `\n\n工作区（近两天活跃）：\n${value.workspaces.map(w => `- ${w.name} \`${w.path}\`（会话 ${w.sessions}，当日改动 ${w.files}）`).join('\n')}`
             : '\n\n未发现活跃工作区。')
+          + (value.usageLine
+            ? `\n\n投入（写进「一、今日概览」表下，数字照抄）：\n${value.usageLine}`
+            : '')
           + (value.headings?.length
             ? `\n\n采集到的小节：\n${value.headings.map(h => `- ${h.replace(/^##\s*/, '')}`).join('\n')}`
             : '')
@@ -1596,6 +1701,7 @@ export function apply(ctx, rawConfig) {
       }
       const headings = lines.filter(line => /^##\s/.test(line)).map(line => line.trim())
       const board = await readBoard(config.reportDir)
+      const usage = parseUsageComment(text)
       return {
         date,
         sourcePath: join(config.reportDir, '_源数据', `${date}.md`),
@@ -1604,6 +1710,8 @@ export function apply(ctx, rawConfig) {
         headings,
         workspaces: parseWorkspaceTable(text),
         boardOpen: board.open.length,
+        // 没有投入节时两个字段都不出现，避免把 null 塞给声明为 object 的输出 schema。
+        ...(usage ? { usage, usageLine: usageSummaryLine(usage) } : {}),
         template: buildTemplate(date),
       }
     },
@@ -1693,6 +1801,13 @@ export function apply(ctx, rawConfig) {
       const mainlines = views.filter(view => todayIds.has(view.id) || view.status === '受阻')
       const stalled = views.filter(view => view.status === '受阻').map(view => view.id)
       const warnings = qualityWarnings(content, minEvidenceOf(config))
+      // 源数据里有投入节时，提醒正文把数字带上；只提醒，不阻断落盘。
+      const sourceUsage = parseUsageComment(
+        await readTextIfExists(join(config.reportDir, '_源数据', `${date}.md`)),
+      )
+      if (sourceUsage && !/token/i.test(content)) {
+        warnings.push('源数据有 token/时间投入，正文没写「投入」行；把源数据 3.5 节的原句补在「一、今日概览」表下')
+      }
       const riskText = sectionLines(content, '四').join('\n')
       for (const view of views) {
         if (view.status !== '受阻' || riskText.includes(view.id)) continue
@@ -1780,6 +1895,8 @@ export function apply(ctx, rawConfig) {
           pushed: { type: 'integer' },
           skipped: { type: 'integer' },
           boardOpen: { type: 'integer' },
+          usage: { type: 'object', description: '区间 token / 时间投入；旧区间源数据没有该节时省略（不返回该字段）。' },
+          usageLine: { type: 'string', description: '一行式区间投入汇总，可写进周期报告第一节。' },
           text: { type: 'string' },
         },
       },
@@ -1816,9 +1933,11 @@ export function apply(ctx, rawConfig) {
       const ledger = parseLedger(await readTextIfExists(join(config.reportDir, LEDGER_FILE)))
       const stallDays = stallDaysOf(config)
       const provided = typeof args.content === 'string' && args.content.trim() !== ''
+      // 区间投入从源数据第 13 节的机器可读行读；旧区间没有就为 null。
+      const rangeUsage = parseUsageComment(await readTextIfExists(periodPath))
       let content = provided
         ? String(args.content)
-        : composePeriodDraft(range, days, daily, board, dateInZone(config.scheduleTimeZone), ledger, stallDays)
+        : composePeriodDraft(range, days, daily, board, dateInZone(config.scheduleTimeZone), ledger, stallDays, rangeUsage)
 
       const problems = []
       const missing = missingPeriodSections(content, range.kind)
@@ -1864,13 +1983,19 @@ export function apply(ctx, rawConfig) {
       const summary = shouldPush
         ? `${kindLabel}已写入 ${reportPath}；区间源数据 ${periodPath}；看板 ${pushed ? `新增 ${pushed} 条` : '无新增条目'}${skipped ? `，跳过重复 ${skipped} 条` : ''}，当前未完成 ${after.open.length} 条。`
         : `${kindLabel}已写入 ${reportPath}；区间源数据 ${periodPath}；按要求未推送看板。`
+      const usageNote = rangeUsage && !/token/i.test(content)
+        ? '\n注意：区间源数据有 token/时间投入，正文没写数字；把第 13 节的原句补到第一节。'
+        : ''
       return {
         periodPath,
         reportPath,
         pushed,
         skipped,
         boardOpen: after.open.length,
-        text: `${summary}${provided ? '' : '\n正文由区间日报自动聚合，可直接使用，也可改写后用 content 重交。'}\n${pushText}`.trim(),
+        ...(rangeUsage
+          ? { usage: rangeUsage, usageLine: usageSummaryLine(rangeUsage, '会话·日') }
+          : {}),
+        text: `${summary}${provided ? '' : '\n正文由区间日报自动聚合，可直接使用，也可改写后用 content 重交。'}${usageNote}\n${pushText}`.trim(),
       }
     },
   })

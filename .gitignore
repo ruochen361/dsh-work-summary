@@ -28,3 +28,4 @@ test/.tmp-quality/
 test/.tmp-archive/
 test/.tmp-workspace/
 test/.tmp-mainline/
+test/.tmp-usage/

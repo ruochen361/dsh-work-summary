@@ -48,6 +48,16 @@ $maxReposPerWorkspace = 12
 # 目录遍历上限：防止把整个用户目录或误配的盘符根扫穿；到顶就停，并在第 1 节注明。
 $maxDirsPerWorkspace = 20000
 
+# 投入统计口径（R35）：
+#   - 活跃时长：会话事件按时间排序，相邻间隔超过 5 分钟视为离开，超出部分不计；
+#   - 工具耗时：tool/call → tool/result 配对，单次最多计 10 分钟，防止一条挂住的命令吃掉整天；
+#   - 等你确认：交互型工具的耗时本质是等你回话，单列，不混进工具耗时。
+$idleCapMs = 5 * 60 * 1000
+$toolCapMs = 10 * 60 * 1000
+$waitTools = @('ask_user_question', 'plugin_manager')
+# 会话里 assistant/message.usage 的字段名（DSH v4 会话格式）。
+# token 以消息落盘时记录的 usage 为准：失败的尝试没有 usage，不计入，口径见源数据脚注。
+
 $skipDirs = @('node_modules', '.pnpm-store', '.git', 'dist', 'build', '.next', 'target',
   'temp', 'tmp', '.cache', '__pycache__', '_源数据', '.dsh-vision-router',
   # 第三方资产/工具目录：装技能、跑示例产生的海量文件不该进日报
@@ -187,6 +197,55 @@ function Test-IgnoredWorkspace([string]$path) {
 
 # ---------- 会话解析 ----------
 # 近两天有活动的会话都读一遍：工作区发现与第 3 节共用这份结果，避免重复解压。
+
+function Format-Duration([long]$ms) {
+  if ($ms -le 0) { return '0m' }
+  $m = [int][Math]::Floor($ms / 60000 + 0.5)
+  if ($m -lt 1) { return '<1m' }
+  if ($m -lt 60) { return "${m}m" }
+  return ('{0}h{1:00}m' -f [int][Math]::Floor($m / 60), ($m % 60))
+}
+
+function Format-TokenCount([long]$n) {
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  if ($n -ge 999950) { return [string]::Format($inv, '{0:0.0}M', $n / 1000000.0) }
+  if ($n -ge 1000) { return [string]::Format($inv, '{0:0.0}K', $n / 1000.0) }
+  return "$n"
+}
+
+function Format-Percent([double]$value) {
+  return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0.0}%', $value)
+}
+
+# 事件间隔封顶后切成区间，多会话取并集才不会被并行会话重复计时。
+function Get-ActiveIntervals($points) {
+  $list = [System.Collections.Generic.List[object]]::new()
+  $arr = @($points | Sort-Object -Unique)
+  for ($i = 0; $i -lt $arr.Count - 1; $i++) {
+    $a = [long]$arr[$i]
+    $b = [long]$arr[$i + 1]
+    if ($b -le $a) { continue }
+    $span = [Math]::Min($b - $a, $idleCapMs)
+    $list.Add([pscustomobject]@{ Start = $a; End = $a + $span })
+  }
+  return ,$list
+}
+
+function Merge-IntervalMs($intervals) {
+  $arr = @($intervals | Sort-Object Start)
+  $merged = [System.Collections.Generic.List[object]]::new()
+  foreach ($iv in $arr) {
+    if ($merged.Count -gt 0 -and $iv.Start -le $merged[-1].End) {
+      if ($iv.End -gt $merged[-1].End) { $merged[-1].End = $iv.End }
+    } else {
+      $merged.Add([pscustomobject]@{ Start = $iv.Start; End = $iv.End })
+    }
+  }
+  $sum = [long]0
+  foreach ($m in $merged) { $sum += ($m.End - $m.Start) }
+  return $sum
+}
+
 function Read-SessionInfo($file) {
   $zstd = (Get-Command zstd -ErrorAction SilentlyContinue).Source
   if (-not $zstd) { $zstd = 'C:\Program Files\poppler\Library\bin\zstd.exe' }
@@ -202,6 +261,19 @@ function Read-SessionInfo($file) {
     ToolNames  = @{}
     Today      = ($file.LastWriteTime -ge $dayStart -and $file.LastWriteTime -lt $dayEnd)
     Error      = $null
+    # 投入统计（R35）
+    TokensIn     = [long]0
+    TokensOut    = [long]0
+    TokensCache  = [long]0
+    TokensTotal  = [long]0
+    Messages     = 0
+    ModelMs      = [long]0
+    ToolMs       = [long]0
+    WaitMs       = [long]0
+    ToolCallN    = 0
+    ActivePoints = [System.Collections.Generic.List[long]]::new()
+    CallInfo     = @{}
+    ActiveIntervals = @()
   }
   if (-not (Test-Path -LiteralPath $zstd)) {
     $info.Error = '未找到 zstd，无法解析会话'
@@ -217,6 +289,7 @@ function Read-SessionInfo($file) {
     foreach ($line in $raw) {
       if (-not $line) { continue }
       try { $o = $line | ConvertFrom-Json } catch { continue }
+      if ($o.time -ge $startMs -and $o.time -lt $endMs) { $info.ActivePoints.Add([long]$o.time) }
       switch ($o.type) {
         'session'       { if ($o.cwd) { $info.Cwd = $o.cwd } }
         'session/title' { if ($o.data.title) { $info.Title = $o.data.title } }
@@ -243,19 +316,60 @@ function Read-SessionInfo($file) {
               if ($r.Length -gt 220) { $r = $r.Substring(0, 220) + '…' }
               $info.LastReply = $r
             }
+            $u = $o.data.usage
+            if ($u) {
+              $info.Messages++
+              $info.TokensIn += [long]$u.inputTokens
+              $info.TokensOut += [long]$u.outputTokens
+              $info.TokensCache += [long]$u.cacheReadTokens
+              $info.TokensTotal += [long]$u.totalTokens
+            }
+            # 模型耗时：回复流第一个 chunk 的时间 → 消息落盘时间。
+            $first = $null
+            foreach ($chunk in @($o.data.stream)) {
+              foreach ($stamp in @($chunk.time, $chunk.time0)) {
+                if ($stamp -and ($null -eq $first -or [long]$stamp -lt $first)) { $first = [long]$stamp }
+              }
+            }
+            if ($null -ne $first -and $o.time -gt $first) { $info.ModelMs += [long]($o.time - $first) }
           }
         }
         'tool/call' {
           if ($o.time -ge $startMs -and $o.time -lt $endMs) {
             $info.ToolToday++
+            $info.ToolCallN++
             if ($o.data.name) { $info.ToolNames[$o.data.name] = 1 + [int]$info.ToolNames[$o.data.name] }
+            if ($o.data.callId) {
+              $info.CallInfo[[string]$o.data.callId] = [pscustomobject]@{ Time = [long]$o.time; Name = [string]$o.data.name }
+            }
           }
           if ($o.time -ge [DateTimeOffset]::new($windowStart).ToUnixTimeMilliseconds() -and $o.time -lt $endMs) {
             $info.ToolWindow++
           }
         }
+        'tool/result' {
+          if ($o.time -ge $startMs -and $o.time -lt $endMs) {
+            # callId 在 data.message.toolCallId；兼容顶层写法。
+            $callId = $o.data.toolCallId
+            if (-not $callId -and $o.data.message) { $callId = $o.data.message.toolCallId }
+            if ($callId -and $info.CallInfo.ContainsKey([string]$callId)) {
+              $call = $info.CallInfo[[string]$callId]
+              # 一个 call 只该配一次结果；重复的 result 事件别把耗时算两遍。
+              $info.CallInfo.Remove([string]$callId)
+              $d = [long]$o.time - [long]$call.Time
+              if ($d -lt 0) { $d = 0 }
+              if ($waitTools -contains $call.Name) {
+                $info.WaitMs += $d
+              } else {
+                if ($d -gt $toolCapMs) { $d = $toolCapMs }
+                $info.ToolMs += $d
+              }
+            }
+          }
+        }
       }
     }
+    $info.ActiveIntervals = Get-ActiveIntervals $info.ActivePoints
   } catch {
     $info.Error = $_.Exception.Message
   }
@@ -664,6 +778,138 @@ if ($NoSessions) {
       if ($info.Users.Count -gt 12) { Add-Line ("  - …另有 {0} 条" -f ($info.Users.Count - 12)) }
       Add-Line ''
     }
+  }
+}
+Add-Line ''
+
+# ---------- 3.5 投入统计（token / 时间，R35） ----------
+# 只统计当日窗口内的事件；多会话并行时活跃时长取并集，不能直接相加。
+Add-Line '## 3.5 投入统计（token / 时间）'
+Add-Line ''
+$usageRows = @()
+if ($NoSessions) {
+  # 重采时沿用上一次的投入节：-NoSessions 只跳过会话解析，不该把已经算好的 token/时间抹掉。
+  $prevUsage = [System.Collections.Generic.List[string]]::new()
+  if (Test-Path -LiteralPath $outFile) {
+    $inSection = $false
+    foreach ($old in (Get-Content -LiteralPath $outFile -Encoding UTF8)) {
+      if ($old -match '^##\s*3\.5\s') { $inSection = $true; continue }
+      if ($inSection) {
+        if ($old -match '^##\s') { break }
+        $prevUsage.Add($old)
+      }
+    }
+  }
+  while ($prevUsage.Count -gt 0 -and [string]$prevUsage[$prevUsage.Count - 1].Trim() -eq '') {
+    $prevUsage.RemoveAt($prevUsage.Count - 1)
+  }
+  while ($prevUsage.Count -gt 0 -and [string]$prevUsage[0].Trim() -eq '') {
+    $prevUsage.RemoveAt(0)
+  }
+  if ($prevUsage.Count -gt 0) {
+    Add-Line '_（-NoSessions 重采，沿用上一次的投入数据；要重算就按正常方式再采一次）_'
+    Add-Line ''
+    foreach ($line in $prevUsage) { Add-Line $line }
+  } else {
+    Add-Line '_（-NoSessions 跳过）_'
+  }
+} else {
+  $activeInfos = @($sessionInfos | Where-Object { $_.ActivePoints.Count -gt 0 })
+  if ($activeInfos.Count -eq 0) {
+    Add-Line '_当日无 DSH 会话活动，无投入数据。_'
+  } else {
+    $groups = @{}
+    $groupOrder = [System.Collections.Generic.List[string]]::new()
+    foreach ($info in $activeInfos) {
+      $wsName = '未归属'
+      $wsPath = ''
+      if ($info.Cwd) {
+        $realCwd = Resolve-RealPath $info.Cwd
+        $match = $workspaces | Where-Object { $realCwd -and (Test-PathUnder $realCwd $_.RealPath) } |
+          Sort-Object { $_.RealPath.Length } -Descending | Select-Object -First 1
+        if ($match) { $wsName = $match.Name; $wsPath = $match.RealPath }
+      }
+      if (-not $groups.ContainsKey($wsName)) {
+        $groups[$wsName] = [pscustomobject]@{
+          Name = $wsName; Path = $wsPath; Sessions = 0
+          Intervals = [System.Collections.Generic.List[object]]::new()
+          ModelMs = [long]0; ToolMs = [long]0; WaitMs = [long]0
+          Input = [long]0; Cache = [long]0; Output = [long]0; Total = [long]0
+        }
+        $groupOrder.Add($wsName)
+      }
+      $g = $groups[$wsName]
+      $g.Sessions++
+      foreach ($iv in $info.ActiveIntervals) { $g.Intervals.Add($iv) }
+      $g.ModelMs += [long]$info.ModelMs
+      $g.ToolMs += [long]$info.ToolMs
+      $g.WaitMs += [long]$info.WaitMs
+      $g.Input += [long]$info.TokensIn
+      $g.Cache += [long]$info.TokensCache
+      $g.Output += [long]$info.TokensOut
+      $g.Total += [long]$info.TokensTotal
+    }
+    $usageRows = @($groupOrder | ForEach-Object {
+      $g = $groups[$_]
+      [pscustomobject]@{
+        Name = $g.Name; Path = $g.Path; Sessions = $g.Sessions
+        ActiveMs = [long](Merge-IntervalMs $g.Intervals)
+        ModelMs = $g.ModelMs; ToolMs = $g.ToolMs; WaitMs = $g.WaitMs
+        Input = $g.Input; Cache = $g.Cache; Output = $g.Output; Total = $g.Total
+      }
+    } | Sort-Object -Property @{ Expression = 'ActiveMs'; Descending = $true })
+
+    $tSessions = [long](($usageRows | Measure-Object -Property Sessions -Sum).Sum)
+    # 合计活跃取全工作区并集：并行会话/跨工作区同时干活不能重复计时，所以它可能小于各行相加。
+    $tActive = [long](Merge-IntervalMs @($activeInfos | ForEach-Object { $_.ActiveIntervals }))
+    $tModel = [long](($usageRows | Measure-Object -Property ModelMs -Sum).Sum)
+    $tTool = [long](($usageRows | Measure-Object -Property ToolMs -Sum).Sum)
+    $tWait = [long](($usageRows | Measure-Object -Property WaitMs -Sum).Sum)
+    $tInput = [long](($usageRows | Measure-Object -Property Input -Sum).Sum)
+    $tCache = [long](($usageRows | Measure-Object -Property Cache -Sum).Sum)
+    $tOutput = [long](($usageRows | Measure-Object -Property Output -Sum).Sum)
+    $tTotal = [long](($usageRows | Measure-Object -Property Total -Sum).Sum)
+    $tDenom = $tInput + $tCache
+    $tHit = if ($tDenom -gt 0) { $tCache / $tDenom * 100 } else { 0 }
+
+    Add-Line ("**投入：** 会话 {0} 个 · 活跃 {1} · 模型 {2} · 工具 {3} · 等你确认 {4}" -f
+      $tSessions, (Format-Duration $tActive), (Format-Duration $tModel), (Format-Duration $tTool), (Format-Duration $tWait))
+    Add-Line ("**Token：** 合计 {0}（新输入 {1} / 缓存读 {2} / 输出 {3}，缓存命中 {4}）" -f
+      (Format-TokenCount $tTotal), (Format-TokenCount $tInput), (Format-TokenCount $tCache),
+      (Format-TokenCount $tOutput), (Format-Percent $tHit))
+    Add-Line ''
+    Add-Line '| 工作区 | 会话 | 活跃 | 模型 | 工具 | 等你确认 | Token | 新输入 | 缓存读 | 输出 | 命中 |'
+    Add-Line '|---|---|---|---|---|---|---|---|---|---|---|'
+    foreach ($row in $usageRows) {
+      $denom = $row.Input + $row.Cache
+      $hit = if ($denom -gt 0) { $row.Cache / $denom * 100 } else { 0 }
+      Add-Line ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} |" -f
+        $row.Name, $row.Sessions, (Format-Duration $row.ActiveMs), (Format-Duration $row.ModelMs),
+        (Format-Duration $row.ToolMs), (Format-Duration $row.WaitMs), (Format-TokenCount $row.Total),
+        (Format-TokenCount $row.Input), (Format-TokenCount $row.Cache), (Format-TokenCount $row.Output),
+        (Format-Percent $hit))
+    }
+    Add-Line ''
+    Add-Line ("- 口径：活跃=会话事件间隔封顶 5 分钟后按会话并集（合计为全工作区并集，按行相加可能略大）；模型=回复流首末；工具=调用配对，单次封顶 10 分钟；等你确认={0} 的等待；token 取 assistant/message.usage，失败重试不计。" -f ($waitTools -join '、'))
+    $usageJson = [ordered]@{
+      sessions = $tSessions
+      activeMs = $tActive
+      modelMs = $tModel
+      toolMs = $tTool
+      waitMs = $tWait
+      input = $tInput
+      cache = $tCache
+      output = $tOutput
+      total = $tTotal
+      byWorkspace = @($usageRows | ForEach-Object {
+        [ordered]@{
+          name = $_.Name; path = $_.Path; sessions = $_.Sessions
+          activeMs = $_.ActiveMs; modelMs = $_.ModelMs; toolMs = $_.ToolMs; waitMs = $_.WaitMs
+          input = $_.Input; cache = $_.Cache; output = $_.Output; total = $_.Total
+        }
+      })
+    }
+    Add-Line ('<!-- dsh-usage ' + ($usageJson | ConvertTo-Json -Compress -Depth 5) + ' -->')
   }
 }
 Add-Line ''
